@@ -92,6 +92,15 @@ pub fn merge_and_write(
     failed.retain(|(p, _)| !newly_imported_paths.contains(p.as_str()));
 
     imported.extend_from_slice(new_imported);
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = Vec::new();
+    for entry in imported.into_iter().rev() {
+        if seen.insert(entry.0.clone()) {
+            deduped.push(entry);
+        }
+    }
+    deduped.reverse();
+    let imported = deduped;
     failed.extend_from_slice(new_failed);
 
     write_manifest(path, zip_name, &imported, &failed)

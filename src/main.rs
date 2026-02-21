@@ -37,6 +37,9 @@ enum Commands {
         /// Print per-file import results instead of progress bar
         #[arg(long)]
         verbose: bool,
+        /// Retry only files that previously failed in manifest
+        #[arg(long)]
+        retry_failed: bool,
     },
     /// Import a single file (for testing)
     Import {
@@ -71,7 +74,8 @@ fn main() -> Result<()> {
             once,
             dry_run,
             verbose,
-        }) => cmd_run(&dir, once, dry_run, verbose)?,
+            retry_failed,
+        }) => cmd_run(&dir, once, dry_run, verbose, retry_failed)?,
         Some(Commands::Import { file, metadata }) => cmd_import(&file, metadata.as_deref())?,
         Some(Commands::Albums { dir }) => cmd_albums(&dir)?,
     }
@@ -95,7 +99,13 @@ fn cmd_check() -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()> {
+fn cmd_run(
+    dir: &PathBuf,
+    once: bool,
+    dry_run: bool,
+    verbose: bool,
+    retry_failed: bool,
+) -> Result<()> {
     let dir = expand_tilde(dir);
     if dry_run {
         display::print_header(&format!("Dry run — scanning {}", dir.display()));
@@ -137,12 +147,33 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
             ".photoferry-extract-{}",
             zip_path.file_stem().unwrap_or_default().to_string_lossy()
         ));
+        if extract_dir.exists() {
+            display::print_info(&format!(
+                "Cleaning stale extract dir: {}",
+                extract_dir.display()
+            ));
+            std::fs::remove_dir_all(&extract_dir)?;
+        }
         std::fs::create_dir_all(&extract_dir)?;
 
         let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
         let manifest_path = dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
 
-        let content_root = takeout::extract_zip(zip_path, &extract_dir)?;
+        let content_root = match takeout::extract_zip(zip_path, &extract_dir) {
+            Ok(root) => root,
+            Err(e) => {
+                display::print_error(&format!(
+                    "Skipping {} — failed to extract: {}",
+                    zip_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                    e
+                ));
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                continue;
+            }
+        };
         let mut inventory = takeout::scan_directory(&content_root)?;
 
         let existing_manifest = manifest::read_manifest(&manifest_path);
@@ -150,6 +181,12 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
             .as_ref()
             .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
             .unwrap_or_default();
+        if dry_run && !already_imported.is_empty() {
+            display::print_info(&format!(
+                "{} already imported (skipping)",
+                already_imported.len()
+            ));
+        }
         if !already_imported.is_empty() {
             inventory.files.retain(|file| {
                 let relative = file
@@ -161,6 +198,29 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
                 !already_imported.contains(&relative)
             });
         }
+        if retry_failed {
+            let failed_paths: std::collections::HashSet<String> = existing_manifest
+                .as_ref()
+                .map(|m| m.failed.iter().map(|e| e.path.clone()).collect())
+                .unwrap_or_default();
+            if failed_paths.is_empty() {
+                display::print_info("No previously-failed files to retry.");
+                return Ok(());
+            }
+            display::print_info(&format!(
+                "Retrying {} previously-failed files",
+                failed_paths.len()
+            ));
+            inventory.files.retain(|file| {
+                let relative = file
+                    .path
+                    .strip_prefix(&content_root)
+                    .unwrap_or(&file.path)
+                    .to_string_lossy()
+                    .to_string();
+                failed_paths.contains(&relative)
+            });
+        }
 
         print_inventory_summary(&inventory);
 
@@ -169,55 +229,39 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
             print_import_summary(&summary);
             total_summary.merge(&summary);
 
-            let mut manifest_imported = existing_manifest
-                .as_ref()
-                .map(|m| {
-                    m.imported
-                        .iter()
-                        .map(|entry| (entry.path.clone(), entry.local_id.clone()))
-                        .collect::<Vec<_>>()
+            let new_imported: Vec<(String, String)> = summary
+                .imported
+                .iter()
+                .map(|file| {
+                    (
+                        file.path
+                            .strip_prefix(&content_root)
+                            .unwrap_or(&file.path)
+                            .to_string_lossy()
+                            .to_string(),
+                        file.local_id.clone(),
+                    )
                 })
-                .unwrap_or_default();
-            manifest_imported.extend(summary.imported.iter().map(|file| {
-                (
-                    file.path
-                        .strip_prefix(&content_root)
-                        .unwrap_or(&file.path)
-                        .to_string_lossy()
-                        .to_string(),
-                    file.local_id.clone(),
-                )
-            }));
-
-            let mut manifest_failed = existing_manifest
-                .as_ref()
-                .map(|m| {
-                    m.failed
-                        .iter()
-                        .map(|entry| (entry.path.clone(), entry.error.clone()))
-                        .collect::<Vec<_>>()
+                .collect();
+            let new_failed: Vec<(String, String)> = summary
+                .failed
+                .iter()
+                .map(|file| {
+                    let p = std::path::Path::new(&file.path);
+                    (
+                        p.strip_prefix(&content_root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .to_string(),
+                        file.error.clone(),
+                    )
                 })
-                .unwrap_or_default();
-            manifest_failed.extend(summary.failed.iter().map(|file| {
-                let file_path = Path::new(&file.path);
-                (
-                    file_path
-                        .strip_prefix(&content_root)
-                        .unwrap_or(file_path)
-                        .to_string_lossy()
-                        .to_string(),
-                    file.error.clone(),
-                )
-            }));
-
-            manifest::write_manifest(
+                .collect();
+            manifest::merge_and_write(
                 &manifest_path,
-                &zip_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                &manifest_imported,
-                &manifest_failed,
+                &zip_path.file_name().unwrap_or_default().to_string_lossy(),
+                &new_imported,
+                &new_failed,
             )?;
         }
 
@@ -391,7 +435,9 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(total as u64);
-        let style = ProgressStyle::with_template("[{bar:40}] {pos}/{len} {msg}")
+        let style = ProgressStyle::with_template(
+            "[{bar:40}] {pos}/{len} {per_sec:.1}/s ETA {eta} {msg}",
+        )
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("##-");
         pb.set_style(style);
@@ -416,8 +462,8 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     error: err.clone(),
                 });
                 if verbose {
-                    display::print_error(&format!(
-                        "[{}/{}] {} — {}",
+                    pb.println(format!(
+                        "  ! [{}/{}] {} — {}",
                         index + 1,
                         total,
                         filename,
@@ -458,21 +504,21 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                             match importer::add_to_album(album_id, actual_local_id) {
                                 Ok(true) => {}
                                 Ok(false) => {
-                                    display::print_warning(&format!(
-                                        "Failed to add '{}' to album '{}'",
+                                    pb.println(format!(
+                                        "  ! Failed to add '{}' to album '{}'",
                                         filename, album_name
                                     ));
                                 }
                                 Err(err) => {
-                                    display::print_warning(&format!(
-                                        "Failed to add '{}' to album '{}': {}",
+                                    pb.println(format!(
+                                        "  ! Failed to add '{}' to album '{}': {}",
                                         filename, album_name, err
                                     ));
                                 }
                             }
                         } else {
-                            display::print_warning(&format!(
-                                "No local identifier for '{}'; skipping album assignment",
+                            pb.println(format!(
+                                "  ! No local identifier for '{}'; skipping album assignment",
                                 filename
                             ));
                         }
@@ -480,11 +526,22 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                 }
 
                 if verbose {
+                    let label = if file.live_photo_pair.is_some() {
+                        let video_name = file
+                            .live_photo_pair
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        format!("{}+{}", filename, video_name)
+                    } else {
+                        filename.clone()
+                    };
                     display::print_success(&format!(
                         "[{}/{}] {} -> {}",
                         index + 1,
                         total,
-                        filename,
+                        label,
                         local_id
                     ));
                 }
@@ -496,8 +553,8 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     error: err.clone(),
                 });
                 if verbose {
-                    display::print_error(&format!(
-                        "[{}/{}] {} — {}",
+                    pb.println(format!(
+                        "  ! [{}/{}] {} — {}",
                         index + 1,
                         total,
                         filename,
@@ -512,8 +569,8 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     error: err.clone(),
                 });
                 if verbose {
-                    display::print_error(&format!(
-                        "[{}/{}] {} — {}",
+                    pb.println(format!(
+                        "  ! [{}/{}] {} — {}",
                         index + 1,
                         total,
                         filename,
