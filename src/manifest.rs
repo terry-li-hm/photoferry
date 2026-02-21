@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct ManifestEntry {
     pub path: String,
     pub local_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,17 +43,18 @@ pub fn already_imported(manifest: &ImportManifest) -> HashSet<String> {
 pub fn write_manifest(
     path: &Path,
     zip_name: &str,
-    imported: &[(String, String)], // (relative_path, local_id)
-    failed: &[(String, String)],   // (relative_path, error)
+    imported: &[(String, String, Option<String>)], // (relative_path, local_id, creation_date)
+    failed: &[(String, String)],                   // (relative_path, error)
 ) -> Result<()> {
     let manifest = ImportManifest {
         zip: zip_name.to_string(),
         processed_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         imported: imported
             .iter()
-            .map(|(p, id)| ManifestEntry {
+            .map(|(p, id, date)| ManifestEntry {
                 path: p.clone(),
                 local_id: id.clone(),
+                creation_date: date.clone(),
             })
             .collect(),
         failed: failed
@@ -75,20 +78,25 @@ pub fn write_manifest(
 pub fn merge_and_write(
     path: &Path,
     zip_name: &str,
-    new_imported: &[(String, String)],
+    new_imported: &[(String, String, Option<String>)],
     new_failed: &[(String, String)],
 ) -> Result<()> {
-    let mut imported: Vec<(String, String)> = Vec::new();
+    let mut imported: Vec<(String, String, Option<String>)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
     if let Some(existing) = read_manifest(path) {
-        imported.extend(existing.imported.into_iter().map(|e| (e.path, e.local_id)));
+        imported.extend(
+            existing
+                .imported
+                .into_iter()
+                .map(|e| (e.path, e.local_id, e.creation_date)),
+        );
         failed.extend(existing.failed.into_iter().map(|e| (e.path, e.error)));
     }
 
     // Remove old failures that succeeded on retry
     let newly_imported_paths: HashSet<&str> =
-        new_imported.iter().map(|(p, _)| p.as_str()).collect();
+        new_imported.iter().map(|(p, _, _)| p.as_str()).collect();
     failed.retain(|(p, _)| !newly_imported_paths.contains(p.as_str()));
 
     imported.extend_from_slice(new_imported);
@@ -121,8 +129,8 @@ mod tests {
         let path = dir.path().join("manifest.json");
 
         let imported = vec![
-            ("photo.jpg".to_string(), "ABC123".to_string()),
-            ("sunset.png".to_string(), "DEF456".to_string()),
+            ("photo.jpg".to_string(), "ABC123".to_string(), None),
+            ("sunset.png".to_string(), "DEF456".to_string(), None),
         ];
         let failed = vec![("corrupt.jpg".to_string(), "bad data".to_string())];
 
@@ -144,7 +152,7 @@ mod tests {
         let failed = vec![("retry.jpg".to_string(), "timeout".to_string())];
         write_manifest(&path, "test.zip", &[], &failed).unwrap();
 
-        let new_imported = vec![("retry.jpg".to_string(), "XYZ789".to_string())];
+        let new_imported = vec![("retry.jpg".to_string(), "XYZ789".to_string(), None)];
         merge_and_write(&path, "test.zip", &new_imported, &[]).unwrap();
 
         let manifest = read_manifest(&path).unwrap();
@@ -158,8 +166,8 @@ mod tests {
             zip: "test.zip".to_string(),
             processed_at: "2026-01-01T00:00:00Z".to_string(),
             imported: vec![
-                ManifestEntry { path: "a.jpg".to_string(), local_id: "1".to_string() },
-                ManifestEntry { path: "b.jpg".to_string(), local_id: "2".to_string() },
+                ManifestEntry { path: "a.jpg".to_string(), local_id: "1".to_string(), creation_date: None },
+                ManifestEntry { path: "b.jpg".to_string(), local_id: "2".to_string(), creation_date: None },
             ],
             failed: vec![],
         };

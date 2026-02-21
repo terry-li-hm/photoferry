@@ -1,15 +1,17 @@
 mod display;
+mod downloader;
 mod importer;
 mod manifest;
 mod metadata;
 mod sidecar;
 mod takeout;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -55,6 +57,36 @@ enum Commands {
         #[arg(default_value = "~/Downloads")]
         dir: PathBuf,
     },
+    /// Verify imported photos exist and are correct in Photos library
+    Verify {
+        /// Directory containing manifest files
+        #[arg(default_value = "~/Downloads")]
+        dir: PathBuf,
+    },
+    /// Download Takeout zips from Google, import, and delete
+    Download {
+        /// Google Takeout job ID
+        #[arg(long)]
+        job: String,
+        /// Google user ID
+        #[arg(long)]
+        user: String,
+        /// Download directory
+        #[arg(long, default_value = "~/Downloads")]
+        dir: PathBuf,
+        /// First part index (default: 0)
+        #[arg(long, default_value_t = 0)]
+        start: usize,
+        /// Last part index inclusive (default: 98 for 99 parts)
+        #[arg(long, default_value_t = 98)]
+        end: usize,
+        /// Download only, skip import
+        #[arg(long)]
+        download_only: bool,
+        /// Print per-file import results
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -78,6 +110,16 @@ fn main() -> Result<()> {
         }) => cmd_run(&dir, once, dry_run, verbose, retry_failed)?,
         Some(Commands::Import { file, metadata }) => cmd_import(&file, metadata.as_deref())?,
         Some(Commands::Albums { dir }) => cmd_albums(&dir)?,
+        Some(Commands::Verify { dir }) => cmd_verify(&dir)?,
+        Some(Commands::Download {
+            job,
+            user,
+            dir,
+            start,
+            end,
+            download_only,
+            verbose,
+        }) => cmd_download(&job, &user, &dir, start, end, download_only, verbose)?,
     }
 
     Ok(())
@@ -141,132 +183,19 @@ fn cmd_run(
             "Processing {}",
             zip_path.file_name().unwrap_or_default().to_string_lossy()
         ));
-
-        // Extract to a temp directory alongside the zip
-        let extract_dir = dir.join(format!(
-            ".photoferry-extract-{}",
-            zip_path.file_stem().unwrap_or_default().to_string_lossy()
-        ));
-        if extract_dir.exists() {
-            display::print_info(&format!(
-                "Cleaning stale extract dir: {}",
-                extract_dir.display()
-            ));
-            std::fs::remove_dir_all(&extract_dir)?;
-        }
-        std::fs::create_dir_all(&extract_dir)?;
-
-        let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
-        let manifest_path = dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
-
-        let content_root = match takeout::extract_zip(zip_path, &extract_dir) {
-            Ok(root) => root,
+        match process_one_zip(zip_path, &dir, dry_run, verbose, retry_failed) {
+            Ok(summary) => {
+                print_import_summary(&summary);
+                total_summary.merge(&summary);
+            }
             Err(e) => {
                 display::print_error(&format!(
-                    "Skipping {} — failed to extract: {}",
-                    zip_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
+                    "Skipping {} — {}",
+                    zip_path.file_name().unwrap_or_default().to_string_lossy(),
                     e
                 ));
-                let _ = std::fs::remove_dir_all(&extract_dir);
-                continue;
             }
-        };
-        let mut inventory = takeout::scan_directory(&content_root)?;
-
-        let existing_manifest = manifest::read_manifest(&manifest_path);
-        let already_imported: HashSet<String> = existing_manifest
-            .as_ref()
-            .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
-            .unwrap_or_default();
-        if dry_run && !already_imported.is_empty() {
-            display::print_info(&format!(
-                "{} already imported (skipping)",
-                already_imported.len()
-            ));
         }
-        if !already_imported.is_empty() {
-            inventory.files.retain(|file| {
-                let relative = file
-                    .path
-                    .strip_prefix(&content_root)
-                    .unwrap_or(&file.path)
-                    .to_string_lossy()
-                    .to_string();
-                !already_imported.contains(&relative)
-            });
-        }
-        if retry_failed {
-            let failed_paths: std::collections::HashSet<String> = existing_manifest
-                .as_ref()
-                .map(|m| m.failed.iter().map(|e| e.path.clone()).collect())
-                .unwrap_or_default();
-            if failed_paths.is_empty() {
-                display::print_info("No previously-failed files to retry.");
-                return Ok(());
-            }
-            display::print_info(&format!(
-                "Retrying {} previously-failed files",
-                failed_paths.len()
-            ));
-            inventory.files.retain(|file| {
-                let relative = file
-                    .path
-                    .strip_prefix(&content_root)
-                    .unwrap_or(&file.path)
-                    .to_string_lossy()
-                    .to_string();
-                failed_paths.contains(&relative)
-            });
-        }
-
-        print_inventory_summary(&inventory);
-
-        if !dry_run {
-            let summary = import_inventory(&inventory, verbose);
-            print_import_summary(&summary);
-            total_summary.merge(&summary);
-
-            let new_imported: Vec<(String, String)> = summary
-                .imported
-                .iter()
-                .map(|file| {
-                    (
-                        file.path
-                            .strip_prefix(&content_root)
-                            .unwrap_or(&file.path)
-                            .to_string_lossy()
-                            .to_string(),
-                        file.local_id.clone(),
-                    )
-                })
-                .collect();
-            let new_failed: Vec<(String, String)> = summary
-                .failed
-                .iter()
-                .map(|file| {
-                    let p = std::path::Path::new(&file.path);
-                    (
-                        p.strip_prefix(&content_root)
-                            .unwrap_or(p)
-                            .to_string_lossy()
-                            .to_string(),
-                        file.error.clone(),
-                    )
-                })
-                .collect();
-            manifest::merge_and_write(
-                &manifest_path,
-                &zip_path.file_name().unwrap_or_default().to_string_lossy(),
-                &new_imported,
-                &new_failed,
-            )?;
-        }
-
-        // Clean up extraction directory
-        std::fs::remove_dir_all(&extract_dir)?;
     }
 
     // Print totals if multiple zips processed
@@ -277,6 +206,136 @@ fn cmd_run(
     }
 
     Ok(())
+}
+
+/// Extract, scan, import, and write manifest for a single zip.
+/// Returns ImportSummary (empty if dry_run).
+fn process_one_zip(
+    zip_path: &Path,
+    manifest_dir: &Path,
+    dry_run: bool,
+    verbose: bool,
+    retry_failed: bool,
+) -> Result<ImportSummary> {
+    let extract_dir = manifest_dir.join(format!(
+        ".photoferry-extract-{}",
+        zip_path.file_stem().unwrap_or_default().to_string_lossy()
+    ));
+    if extract_dir.exists() {
+        display::print_info(&format!(
+            "Cleaning stale extract dir: {}",
+            extract_dir.display()
+        ));
+        std::fs::remove_dir_all(&extract_dir)?;
+    }
+    std::fs::create_dir_all(&extract_dir)?;
+
+    let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
+    let manifest_path = manifest_dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
+
+    let content_root = match takeout::extract_zip(zip_path, &extract_dir) {
+        Ok(root) => root,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err(e.context("Failed to extract zip"));
+        }
+    };
+    let mut inventory = takeout::scan_directory(&content_root)?;
+
+    let existing_manifest = manifest::read_manifest(&manifest_path);
+    let already_imported: HashSet<String> = existing_manifest
+        .as_ref()
+        .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
+        .unwrap_or_default();
+    if dry_run && !already_imported.is_empty() {
+        display::print_info(&format!(
+            "{} already imported (skipping)",
+            already_imported.len()
+        ));
+    }
+    if !already_imported.is_empty() {
+        inventory.files.retain(|file| {
+            let relative = file
+                .path
+                .strip_prefix(&content_root)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .to_string();
+            !already_imported.contains(&relative)
+        });
+    }
+    if retry_failed {
+        let failed_paths: HashSet<String> = existing_manifest
+            .as_ref()
+            .map(|m| m.failed.iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default();
+        if failed_paths.is_empty() {
+            display::print_info("No previously-failed files to retry.");
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Ok(ImportSummary::default());
+        }
+        display::print_info(&format!(
+            "Retrying {} previously-failed files",
+            failed_paths.len()
+        ));
+        inventory.files.retain(|file| {
+            let relative = file
+                .path
+                .strip_prefix(&content_root)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .to_string();
+            failed_paths.contains(&relative)
+        });
+    }
+
+    print_inventory_summary(&inventory);
+
+    if dry_run {
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        return Ok(ImportSummary::default());
+    }
+
+    let summary = import_inventory(&inventory, verbose);
+
+    let new_imported: Vec<(String, String, Option<String>)> = summary
+        .imported
+        .iter()
+        .map(|file| {
+            (
+                file.path
+                    .strip_prefix(&content_root)
+                    .unwrap_or(&file.path)
+                    .to_string_lossy()
+                    .to_string(),
+                file.local_id.clone(),
+                file.creation_date.clone(),
+            )
+        })
+        .collect();
+    let new_failed: Vec<(String, String)> = summary
+        .failed
+        .iter()
+        .map(|file| {
+            let p = std::path::Path::new(&file.path);
+            (
+                p.strip_prefix(&content_root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .to_string(),
+                file.error.clone(),
+            )
+        })
+        .collect();
+    manifest::merge_and_write(
+        &manifest_path,
+        &zip_path.file_name().unwrap_or_default().to_string_lossy(),
+        &new_imported,
+        &new_failed,
+    )?;
+
+    std::fs::remove_dir_all(&extract_dir)?;
+    Ok(summary)
 }
 
 fn cmd_import(file: &PathBuf, metadata_json: Option<&str>) -> Result<()> {
@@ -349,6 +408,175 @@ fn cmd_albums(dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_download(
+    job_id: &str,
+    user_id: &str,
+    dir: &PathBuf,
+    start: usize,
+    end: usize,
+    download_only: bool,
+    verbose: bool,
+) -> Result<()> {
+    let dir = expand_tilde(dir);
+    std::fs::create_dir_all(&dir)?;
+
+    display::print_header(&format!(
+        "Downloading Takeout parts {start}–{end} → {}",
+        dir.display()
+    ));
+
+    // Check Photos access up front (unless download-only)
+    if !download_only {
+        let access = importer::check_access()?;
+        if !access.authorized {
+            bail!(
+                "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
+                access.status
+            );
+        }
+        display::print_success(&format!("Photos access: {} (authorized)", access.status));
+    }
+
+    // Load or create download progress manifest
+    let mut progress = downloader::DownloadProgress::load(&dir, job_id);
+    progress.user_id = user_id.to_string();
+    progress.save(&dir)?;
+
+    display::print_info("Extracting Chrome cookies...");
+    let cookies = downloader::get_chrome_cookies()
+        .context("Failed to get Chrome cookies — ensure Chrome is running and logged into Google")?;
+    display::print_success(&format!("Got {} Google cookies", cookies.len()));
+
+    let client = downloader::build_client(&cookies)?;
+
+    let mut total_imported = 0usize;
+    let mut total_failed_dl = 0usize;
+    let mut total_failed_import = 0usize;
+
+    for i in start..=end {
+        if progress.is_completed(i) {
+            display::print_info(&format!("  [{i:02}] Already done, skipping"));
+            continue;
+        }
+
+        println!();
+        display::print_header(&format!("Part {i}/{end}"));
+
+        // Disk space guard — wait until ≥20GB free before downloading
+        const MIN_FREE_GB: u64 = 20;
+        loop {
+            match available_space_gb(&dir) {
+                Some(gb) if gb >= MIN_FREE_GB => break,
+                Some(gb) => {
+                    display::print_warning(&format!(
+                        "  [{i:02}] Low disk: {gb}GB free (need {MIN_FREE_GB}GB) — waiting 60s for iCloud to upload"
+                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                }
+                None => break, // Can't check — proceed anyway
+            }
+        }
+
+        // Download
+        let zip_path = match downloader::download_zip(&client, job_id, user_id, i, &dir) {
+            Ok(p) => p,
+            Err(e) => {
+                display::print_error(&format!("  [{i:02}] Download failed: {e}"));
+                // Retry once after 10s
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                match downloader::download_zip(&client, job_id, user_id, i, &dir) {
+                    Ok(p) => p,
+                    Err(e2) => {
+                        display::print_error(&format!(
+                            "  [{i:02}] Retry failed: {e2} — skipping"
+                        ));
+                        progress.mark_failed(i, &dir);
+                        total_failed_dl += 1;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        if download_only {
+            display::print_success(&format!(
+                "  [{i:02}] Downloaded → {}",
+                zip_path.display()
+            ));
+            progress.mark_completed(i, &dir);
+            total_imported += 1;
+            continue;
+        }
+
+        // Import
+        display::print_info(&format!(
+            "  [{i:02}] Importing {}...",
+            zip_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        match process_one_zip(&zip_path, &dir, false, verbose, false) {
+            Ok(summary) => {
+                print_import_summary(&summary);
+                total_imported += summary.imported.len();
+                let had_failures = !summary.failed.is_empty();
+                if had_failures {
+                    total_failed_import += summary.failed.len();
+                    display::print_warning(&format!(
+                        "  [{i:02}] {} files failed — zip kept for retry",
+                        summary.failed.len()
+                    ));
+                    // Don't mark completed — allow retry on next run
+                } else {
+                    // Verify all assets exist in Photos Library before deleting zip
+                    if verify_zip_manifest(&zip_path, &dir) {
+                        if let Err(e) = std::fs::remove_file(&zip_path) {
+                            display::print_warning(&format!(
+                                "  [{i:02}] Verified OK but could not delete zip: {e}"
+                            ));
+                        } else {
+                            display::print_success(&format!(
+                                "  [{i:02}] Verified + deleted {}",
+                                zip_path.file_name().unwrap_or_default().to_string_lossy()
+                            ));
+                        }
+                        progress.mark_completed(i, &dir);
+                    } else {
+                        display::print_warning(&format!(
+                            "  [{i:02}] Import OK but verify failed — keeping zip"
+                        ));
+                        // Don't mark completed — verify on next run
+                    }
+                }
+            }
+            Err(e) => {
+                display::print_error(&format!("  [{i:02}] Import failed: {e} — zip kept"));
+                progress.mark_failed(i, &dir);
+                total_failed_import += 1;
+            }
+        }
+    }
+
+    println!();
+    display::print_header("Download run complete");
+    display::print_info(&format!("Parts completed: {}", progress.completed.len()));
+    if download_only {
+        display::print_info(&format!("Downloaded: {total_imported}"));
+    } else {
+        display::print_info(&format!("Photos imported: {total_imported}"));
+    }
+    if total_failed_dl > 0 {
+        display::print_error(&format!("Download failures: {total_failed_dl}"));
+    }
+    if total_failed_import > 0 {
+        display::print_warning(&format!("Import failures: {total_failed_import}"));
+    }
+    if total_failed_dl == 0 && total_failed_import == 0 {
+        display::print_success("All parts completed successfully");
+    }
+
+    Ok(())
+}
+
 // MARK: - Helpers
 
 fn print_inventory_summary(inventory: &takeout::TakeoutInventory) {
@@ -384,6 +612,7 @@ struct ImportedFile {
     path: PathBuf,
     local_id: String,
     album: Option<String>,
+    creation_date: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -400,6 +629,7 @@ impl ImportSummary {
                 path: file.path.clone(),
                 local_id: file.local_id.clone(),
                 album: file.album.clone(),
+                creation_date: file.creation_date.clone(),
             }));
         self.failed.extend(other.failed.iter().map(|f| ImportFailure {
             path: f.path.clone(),
@@ -496,6 +726,7 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     path: file.path.clone(),
                     local_id: local_id.clone(),
                     album: file.album.clone(),
+                    creation_date: file.metadata.as_ref().and_then(|m| m.creation_date.clone()),
                 });
 
                 if let Some(album_name) = file.album.as_ref() {
@@ -604,6 +835,181 @@ fn print_import_summary(summary: &ImportSummary) {
         display::print_warning("Failed files:");
         for failed in &summary.failed {
             display::print_error(&format!("{} — {}", failed.path, failed.error));
+        }
+    }
+}
+
+fn cmd_verify(dir: &PathBuf) -> Result<()> {
+    let dir = expand_tilde(dir);
+    display::print_header(&format!("Verifying imports in {}", dir.display()));
+
+    let manifests: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(".photoferry-manifest-") && n.ends_with(".json"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if manifests.is_empty() {
+        display::print_info("No manifests found.");
+        return Ok(());
+    }
+
+    let access = importer::check_access()?;
+    if !access.authorized {
+        bail!("Photos access not authorized");
+    }
+
+    let mut total_verified = 0usize;
+    let mut total_missing = 0usize;
+    let mut total_wrong_date = 0usize;
+
+    for manifest_path in &manifests {
+        let manifest = match manifest::read_manifest(manifest_path) {
+            Some(m) => m,
+            None => {
+                display::print_warning(&format!("Could not read {:?}", manifest_path));
+                continue;
+            }
+        };
+
+        display::print_header(&format!("Verifying {}", manifest.zip));
+        display::print_info(&format!(
+            "Checking {} imported assets...",
+            manifest.imported.len()
+        ));
+
+        let ids: Vec<&str> = manifest.imported.iter().map(|e| e.local_id.as_str()).collect();
+        let results = importer::verify_assets(&ids)?;
+
+        let result_map: HashMap<&str, &importer::AssetVerifyResult> =
+            results.iter().map(|r| (r.local_identifier.as_str(), r)).collect();
+
+        let mut missing = vec![];
+        let mut wrong_date = vec![];
+
+        for entry in &manifest.imported {
+            match result_map.get(entry.local_id.as_str()) {
+                None | Some(importer::AssetVerifyResult { found: false, .. }) => {
+                    missing.push(entry);
+                }
+                Some(result) => {
+                    total_verified += 1;
+                    if let (Some(expected), Some(actual)) =
+                        (&entry.creation_date, &result.creation_date)
+                    {
+                        if !dates_match(expected, actual) {
+                            wrong_date.push((entry, actual.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for e in &missing {
+            display::print_error(&format!("MISSING: {} ({})", e.path, e.local_id));
+            total_missing += 1;
+        }
+        for (e, actual) in &wrong_date {
+            display::print_warning(&format!(
+                "DATE MISMATCH: {} — expected {} got {}",
+                e.path,
+                e.creation_date.as_deref().unwrap_or("?"),
+                actual
+            ));
+            total_wrong_date += 1;
+        }
+
+        display::print_info(&format!(
+            "Verified: {} | Missing: {} | Wrong date: {}",
+            manifest.imported.len() - missing.len() - wrong_date.len(),
+            missing.len(),
+            wrong_date.len()
+        ));
+    }
+
+    println!();
+    display::print_header("Total");
+    display::print_info(&format!("Verified OK: {}", total_verified));
+    if total_missing > 0 {
+        display::print_error(&format!("Missing: {}", total_missing));
+    }
+    if total_wrong_date > 0 {
+        display::print_warning(&format!("Wrong date: {}", total_wrong_date));
+    }
+    if total_missing == 0 && total_wrong_date == 0 {
+        display::print_success("All assets verified successfully");
+    }
+
+    Ok(())
+}
+
+fn dates_match(a: &str, b: &str) -> bool {
+    // Compare first 19 chars (YYYY-MM-DDTHH:MM:SS) — ignore timezone/subsecond
+    a.len() >= 19 && b.len() >= 19 && a[..19] == b[..19]
+}
+
+/// Returns available disk space in GB for the filesystem containing `path`.
+/// Uses `df -k` — returns None if the command fails or output is unparseable.
+fn available_space_gb(path: &Path) -> Option<u64> {
+    let output = Command::new("df").arg("-k").arg(path).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Second line is the data row: Filesystem 1K-blocks Used Available Capacity ...
+    let data_line = stdout.lines().nth(1)?;
+    let fields: Vec<&str> = data_line.split_whitespace().collect();
+    let avail_kb: u64 = fields.get(3)?.parse().ok()?;
+    Some(avail_kb / (1024 * 1024)) // KB → GB
+}
+
+/// Batch-verify all assets recorded in a zip's manifest exist in Photos Library.
+/// Returns true if all present (safe to delete zip), false if any missing.
+fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
+    let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
+    let manifest_path = manifest_dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
+    let manifest = match manifest::read_manifest(&manifest_path) {
+        Some(m) => m,
+        None => {
+            display::print_warning("  Verify: manifest missing — refusing to delete zip");
+            return false;
+        }
+    };
+    if manifest.imported.is_empty() {
+        if !manifest.failed.is_empty() {
+            display::print_warning(&format!(
+                "  Verify: {} failed imports — keeping zip",
+                manifest.failed.len()
+            ));
+            return false;
+        }
+        return true;
+    }
+    let ids: Vec<&str> = manifest.imported.iter().map(|e| e.local_id.as_str()).collect();
+    match importer::verify_assets(&ids) {
+        Ok(results) => {
+            let missing = results.iter().filter(|r| !r.found).count();
+            if missing > 0 {
+                display::print_warning(&format!(
+                    "  Verify: {}/{} confirmed — {} missing, keeping zip",
+                    results.len() - missing,
+                    results.len(),
+                    missing
+                ));
+                false
+            } else {
+                display::print_success(&format!(
+                    "  Verify: all {} assets confirmed in Photos Library",
+                    results.len()
+                ));
+                true
+            }
+        }
+        Err(e) => {
+            display::print_warning(&format!("  Verify error: {e} — keeping zip as precaution"));
+            false
         }
     }
 }

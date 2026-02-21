@@ -307,6 +307,60 @@ public func createAlbum(title: SRString) -> SRString {
     return SRString("{\"album_id\":\"\(albumIdentifier ?? "")\"}")
 }
 
+// MARK: - Verify Assets
+
+struct AssetVerifyResult: Codable {
+    let localIdentifier: String
+    let found: Bool
+    let creationDate: String?
+    let hasPairedVideo: Bool
+}
+
+@_cdecl("photoferry_verify_assets")
+public func verifyAssets(identifiersJSON: SRString) -> SRString {
+    let json = identifiersJSON.toString()
+    guard let data = json.data(using: .utf8),
+          let identifiers = try? JSONDecoder().decode([String].self, from: data)
+    else {
+        return SRString("{\"error\":\"invalid_input\"}")
+    }
+
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime]
+
+    let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+
+    var results: [AssetVerifyResult] = []
+    var foundIds = Set<String>()
+
+    fetchResult.enumerateObjects { asset, _, _ in
+        foundIds.insert(asset.localIdentifier)
+        let resources = PHAssetResource.assetResources(for: asset)
+        let hasPaired = resources.contains {
+            $0.type == .pairedVideo || $0.type == .fullSizePairedVideo
+        }
+        let dateStr = asset.creationDate.map { formatter.string(from: $0) }
+        results.append(AssetVerifyResult(
+            localIdentifier: asset.localIdentifier,
+            found: true,
+            creationDate: dateStr,
+            hasPairedVideo: hasPaired
+        ))
+    }
+
+    // Report missing assets (silently omitted by PHFetchResult)
+    for id in identifiers where !foundIds.contains(id) {
+        results.append(AssetVerifyResult(
+            localIdentifier: id,
+            found: false,
+            creationDate: nil,
+            hasPairedVideo: false
+        ))
+    }
+
+    return SRString(toJSON(results))
+}
+
 // MARK: - Add to Album
 
 @_cdecl("photoferry_add_to_album")

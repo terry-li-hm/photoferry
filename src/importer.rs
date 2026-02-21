@@ -11,6 +11,7 @@ swift!(fn photoferry_import_photo(path: &SRString, metadata_json: &SRString) -> 
 swift!(fn photoferry_import_live_photo(photo_path: &SRString, video_path: &SRString, metadata_json: &SRString) -> SRString);
 swift!(fn photoferry_create_album(title: &SRString) -> SRString);
 swift!(fn photoferry_add_to_album(album_id: &SRString, asset_id: &SRString) -> Bool);
+swift!(fn photoferry_verify_assets(identifiers_json: &SRString) -> SRString);
 
 // MARK: - Types
 
@@ -44,6 +45,17 @@ pub struct ImportResult {
 pub struct AccessResult {
     pub authorized: bool,
     pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AssetVerifyResult {
+    #[serde(rename = "localIdentifier")]
+    pub local_identifier: String,
+    pub found: bool,
+    #[serde(rename = "creationDate")]
+    pub creation_date: Option<String>,
+    #[serde(rename = "hasPairedVideo")]
+    pub has_paired_video: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +114,14 @@ pub fn create_album(title: &str) -> Result<String> {
     result
         .album_id
         .ok_or_else(|| anyhow::anyhow!("No album ID returned"))
+}
+
+pub fn verify_assets(local_ids: &[&str]) -> Result<Vec<AssetVerifyResult>> {
+    let ids_json = serde_json::to_string(local_ids)?;
+    let ids_sr: SRString = ids_json.as_str().into();
+    let json = unsafe { photoferry_verify_assets(&ids_sr) };
+    let results: Vec<AssetVerifyResult> = serde_json::from_str(json.as_str())?;
+    Ok(results)
 }
 
 pub fn add_to_album(album_id: &str, asset_id: &str) -> Result<bool> {
