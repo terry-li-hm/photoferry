@@ -8,6 +8,7 @@ use swift_rs::{Bool, SRString, swift};
 
 swift!(fn photoferry_check_access() -> SRString);
 swift!(fn photoferry_import_photo(path: &SRString, metadata_json: &SRString) -> SRString);
+swift!(fn photoferry_import_live_photo(photo_path: &SRString, video_path: &SRString, metadata_json: &SRString) -> SRString);
 swift!(fn photoferry_create_album(title: &SRString) -> SRString);
 swift!(fn photoferry_add_to_album(album_id: &SRString, asset_id: &SRString) -> Bool);
 
@@ -68,6 +69,24 @@ pub fn import_photo(path: &str, metadata: Option<&PhotoMetadata>) -> Result<Impo
     let meta_sr: SRString = meta_json.as_str().into();
 
     let json = unsafe { photoferry_import_photo(&path_sr, &meta_sr) };
+    let result: ImportResult = serde_json::from_str(json.as_str())?;
+    Ok(result)
+}
+
+pub fn import_live_photo(
+    photo_path: &str,
+    video_path: &str,
+    metadata: Option<&PhotoMetadata>,
+) -> Result<ImportResult> {
+    let photo_path_sr: SRString = photo_path.into();
+    let video_path_sr: SRString = video_path.into();
+    let meta_json = match metadata {
+        Some(m) => serde_json::to_string(m)?,
+        None => String::new(),
+    };
+    let meta_sr: SRString = meta_json.as_str().into();
+
+    let json = unsafe { photoferry_import_live_photo(&photo_path_sr, &video_path_sr, &meta_sr) };
     let result: ImportResult = serde_json::from_str(json.as_str())?;
     Ok(result)
 }

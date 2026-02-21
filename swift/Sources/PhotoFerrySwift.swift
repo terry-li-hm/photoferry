@@ -185,6 +185,101 @@ public func importPhoto(path: SRString, metadataJSON: SRString) -> SRString {
     return SRString(toJSON(result))
 }
 
+@_cdecl("photoferry_import_live_photo")
+public func importLivePhoto(photoPath: SRString, videoPath: SRString, metadataJSON: SRString) -> SRString {
+    let photoFilePath = photoPath.toString()
+    let videoFilePath = videoPath.toString()
+    let photoURL = URL(fileURLWithPath: photoFilePath)
+    let videoURL = URL(fileURLWithPath: videoFilePath)
+
+    guard FileManager.default.fileExists(atPath: photoFilePath) else {
+        let result = ImportResult(
+            success: false,
+            localIdentifier: nil,
+            error: "File not found: \(photoFilePath)"
+        )
+        return SRString(toJSON(result))
+    }
+
+    guard FileManager.default.fileExists(atPath: videoFilePath) else {
+        let result = ImportResult(
+            success: false,
+            localIdentifier: nil,
+            error: "File not found: \(videoFilePath)"
+        )
+        return SRString(toJSON(result))
+    }
+
+    // Parse metadata
+    var metadata: PhotoMetadata? = nil
+    let metaStr = metadataJSON.toString()
+    if !metaStr.isEmpty, let data = metaStr.data(using: .utf8) {
+        metadata = try? JSONDecoder().decode(PhotoMetadata.self, from: data)
+    }
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var localIdentifier: String? = nil
+    var importError: String? = nil
+
+    PHPhotoLibrary.shared().performChanges({
+        let req = PHAssetCreationRequest.forAsset()
+        req.addResource(with: .photo, fileURL: photoURL, options: nil)
+        req.addResource(with: .pairedVideo, fileURL: videoURL, options: nil)
+
+        // Apply metadata
+        if let meta = metadata {
+            if let dateStr = meta.creationDate {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                if let date = formatter.date(from: dateStr) {
+                    req.creationDate = date
+                } else {
+                    formatter.formatOptions = [.withInternetDateTime]
+                    if let date = formatter.date(from: dateStr) {
+                        req.creationDate = date
+                    }
+                }
+            }
+
+            if let lat = meta.latitude, let lon = meta.longitude,
+               !(lat == 0.0 && lon == 0.0) {
+                if let alt = meta.altitude {
+                    req.location = CLLocation(
+                        coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                        altitude: alt,
+                        horizontalAccuracy: 0,
+                        verticalAccuracy: 0,
+                        timestamp: Date()
+                    )
+                } else {
+                    req.location = CLLocation(latitude: lat, longitude: lon)
+                }
+            }
+
+            if let favorite = meta.isFavorite {
+                req.isFavorite = favorite
+            }
+        }
+
+        localIdentifier = req.placeholderForCreatedAsset?.localIdentifier
+    }) { success, error in
+        if !success {
+            importError = error?.localizedDescription ?? "Unknown PhotoKit error"
+        }
+        semaphore.signal()
+    }
+
+    semaphore.wait()
+
+    if let err = importError {
+        let result = ImportResult(success: false, localIdentifier: nil, error: err)
+        return SRString(toJSON(result))
+    }
+
+    let result = ImportResult(success: true, localIdentifier: localIdentifier, error: nil)
+    return SRString(toJSON(result))
+}
+
 // MARK: - Create Album
 
 @_cdecl("photoferry_create_album")
