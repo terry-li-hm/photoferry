@@ -1,0 +1,163 @@
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    pub path: String,
+    pub local_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestFailure {
+    pub path: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportManifest {
+    pub zip: String,
+    pub processed_at: String,
+    pub imported: Vec<ManifestEntry>,
+    pub failed: Vec<ManifestFailure>,
+}
+
+/// Read an existing manifest file. Returns None on any error (missing, corrupt, etc).
+pub fn read_manifest(path: &Path) -> Option<ImportManifest> {
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Build a set of already-imported paths from a manifest.
+pub fn already_imported(manifest: &ImportManifest) -> HashSet<String> {
+    manifest.imported.iter().map(|e| e.path.clone()).collect()
+}
+
+/// Write a manifest to disk. Uses write-to-tmp-then-rename for atomicity.
+pub fn write_manifest(
+    path: &Path,
+    zip_name: &str,
+    imported: &[(String, String)], // (relative_path, local_id)
+    failed: &[(String, String)],   // (relative_path, error)
+) -> Result<()> {
+    let manifest = ImportManifest {
+        zip: zip_name.to_string(),
+        processed_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        imported: imported
+            .iter()
+            .map(|(p, id)| ManifestEntry {
+                path: p.clone(),
+                local_id: id.clone(),
+            })
+            .collect(),
+        failed: failed
+            .iter()
+            .map(|(p, e)| ManifestFailure {
+                path: p.clone(),
+                error: e.clone(),
+            })
+            .collect(),
+    };
+
+    let json = serde_json::to_string_pretty(&manifest)?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, json)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Merge new results into an existing manifest (appends to imported/failed lists).
+/// Previously-failed entries that succeeded this time are removed from failed.
+pub fn merge_and_write(
+    path: &Path,
+    zip_name: &str,
+    new_imported: &[(String, String)],
+    new_failed: &[(String, String)],
+) -> Result<()> {
+    let mut imported: Vec<(String, String)> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    if let Some(existing) = read_manifest(path) {
+        imported.extend(existing.imported.into_iter().map(|e| (e.path, e.local_id)));
+        failed.extend(existing.failed.into_iter().map(|e| (e.path, e.error)));
+    }
+
+    // Remove old failures that succeeded on retry
+    let newly_imported_paths: HashSet<&str> =
+        new_imported.iter().map(|(p, _)| p.as_str()).collect();
+    failed.retain(|(p, _)| !newly_imported_paths.contains(p.as_str()));
+
+    imported.extend_from_slice(new_imported);
+    failed.extend_from_slice(new_failed);
+
+    write_manifest(path, zip_name, &imported, &failed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_nonexistent() {
+        assert!(read_manifest(Path::new("/nonexistent/manifest.json")).is_none());
+    }
+
+    #[test]
+    fn test_write_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        let imported = vec![
+            ("photo.jpg".to_string(), "ABC123".to_string()),
+            ("sunset.png".to_string(), "DEF456".to_string()),
+        ];
+        let failed = vec![("corrupt.jpg".to_string(), "bad data".to_string())];
+
+        write_manifest(&path, "takeout-20240101.zip", &imported, &failed).unwrap();
+
+        let manifest = read_manifest(&path).unwrap();
+        assert_eq!(manifest.zip, "takeout-20240101.zip");
+        assert_eq!(manifest.imported.len(), 2);
+        assert_eq!(manifest.failed.len(), 1);
+        assert_eq!(manifest.imported[0].path, "photo.jpg");
+        assert_eq!(manifest.imported[0].local_id, "ABC123");
+    }
+
+    #[test]
+    fn test_merge_removes_retried_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+
+        let failed = vec![("retry.jpg".to_string(), "timeout".to_string())];
+        write_manifest(&path, "test.zip", &[], &failed).unwrap();
+
+        let new_imported = vec![("retry.jpg".to_string(), "XYZ789".to_string())];
+        merge_and_write(&path, "test.zip", &new_imported, &[]).unwrap();
+
+        let manifest = read_manifest(&path).unwrap();
+        assert_eq!(manifest.imported.len(), 1);
+        assert_eq!(manifest.failed.len(), 0);
+    }
+
+    #[test]
+    fn test_already_imported_set() {
+        let manifest = ImportManifest {
+            zip: "test.zip".to_string(),
+            processed_at: "2026-01-01T00:00:00Z".to_string(),
+            imported: vec![
+                ManifestEntry { path: "a.jpg".to_string(), local_id: "1".to_string() },
+                ManifestEntry { path: "b.jpg".to_string(), local_id: "2".to_string() },
+            ],
+            failed: vec![],
+        };
+
+        let set = already_imported(&manifest);
+        assert!(set.contains("a.jpg"));
+        assert!(set.contains("b.jpg"));
+        assert!(!set.contains("c.jpg"));
+    }
+}

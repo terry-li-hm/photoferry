@@ -1,5 +1,6 @@
 mod display;
 mod importer;
+mod manifest;
 mod metadata;
 mod sidecar;
 mod takeout;
@@ -7,6 +8,7 @@ mod takeout;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -137,8 +139,28 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
         ));
         std::fs::create_dir_all(&extract_dir)?;
 
+        let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
+        let manifest_path = dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
+
         let content_root = takeout::extract_zip(zip_path, &extract_dir)?;
-        let inventory = takeout::scan_directory(&content_root)?;
+        let mut inventory = takeout::scan_directory(&content_root)?;
+
+        let existing_manifest = manifest::read_manifest(&manifest_path);
+        let already_imported: HashSet<String> = existing_manifest
+            .as_ref()
+            .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default();
+        if !already_imported.is_empty() {
+            inventory.files.retain(|file| {
+                let relative = file
+                    .path
+                    .strip_prefix(&content_root)
+                    .unwrap_or(&file.path)
+                    .to_string_lossy()
+                    .to_string();
+                !already_imported.contains(&relative)
+            });
+        }
 
         print_inventory_summary(&inventory);
 
@@ -146,6 +168,57 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()
             let summary = import_inventory(&inventory, verbose);
             print_import_summary(&summary);
             total_summary.merge(&summary);
+
+            let mut manifest_imported = existing_manifest
+                .as_ref()
+                .map(|m| {
+                    m.imported
+                        .iter()
+                        .map(|entry| (entry.path.clone(), entry.local_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            manifest_imported.extend(summary.imported.iter().map(|file| {
+                (
+                    file.path
+                        .strip_prefix(&content_root)
+                        .unwrap_or(&file.path)
+                        .to_string_lossy()
+                        .to_string(),
+                    file.local_id.clone(),
+                )
+            }));
+
+            let mut manifest_failed = existing_manifest
+                .as_ref()
+                .map(|m| {
+                    m.failed
+                        .iter()
+                        .map(|entry| (entry.path.clone(), entry.error.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            manifest_failed.extend(summary.failed.iter().map(|file| {
+                let file_path = Path::new(&file.path);
+                (
+                    file_path
+                        .strip_prefix(&content_root)
+                        .unwrap_or(file_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    file.error.clone(),
+                )
+            }));
+
+            manifest::write_manifest(
+                &manifest_path,
+                &zip_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                &manifest_imported,
+                &manifest_failed,
+            )?;
         }
 
         // Clean up extraction directory
@@ -262,16 +335,28 @@ struct ImportFailure {
     error: String,
 }
 
+#[derive(Debug)]
+struct ImportedFile {
+    path: PathBuf,
+    local_id: String,
+    album: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct ImportSummary {
-    imported: usize,
+    imported: Vec<ImportedFile>,
     failed: Vec<ImportFailure>,
     elapsed: std::time::Duration,
 }
 
 impl ImportSummary {
     fn merge(&mut self, other: &ImportSummary) {
-        self.imported += other.imported;
+        self.imported
+            .extend(other.imported.iter().map(|file| ImportedFile {
+                path: file.path.clone(),
+                local_id: file.local_id.clone(),
+                album: file.album.clone(),
+            }));
         self.failed.extend(other.failed.iter().map(|f| ImportFailure {
             path: f.path.clone(),
             error: f.error.clone(),
@@ -284,10 +369,22 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
     let total = inventory.files.len();
     let mut summary = ImportSummary::default();
     let start = Instant::now();
+    let mut album_ids: HashMap<String, String> = HashMap::new();
 
     if total == 0 {
         display::print_warning("No media files found to import.");
         return summary;
+    }
+
+    for album in inventory.albums.iter().cloned().collect::<HashSet<_>>() {
+        match importer::create_album(&album) {
+            Ok(album_id) => {
+                album_ids.insert(album, album_id);
+            }
+            Err(err) => {
+                display::print_warning(&format!("Failed to create album '{}': {}", album, err));
+            }
+        }
     }
 
     let pb = if verbose {
@@ -332,11 +429,57 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
             }
         };
 
-        match importer::import_photo(path, file.metadata.as_ref()) {
+        let import_result = if let Some(ref video_path) = file.live_photo_pair {
+            match video_path.to_str() {
+                Some(video_str) => {
+                    importer::import_live_photo(path, video_str, file.metadata.as_ref())
+                }
+                None => Err(anyhow::anyhow!("Invalid UTF-8 in Live Photo video path")),
+            }
+        } else {
+            importer::import_photo(path, file.metadata.as_ref())
+        };
+
+        match import_result {
             Ok(result) if result.success => {
-                summary.imported += 1;
+                let local_id = result
+                    .local_identifier
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                summary.imported.push(ImportedFile {
+                    path: file.path.clone(),
+                    local_id: local_id.clone(),
+                    album: file.album.clone(),
+                });
+
+                if let Some(album_name) = file.album.as_ref() {
+                    if let Some(album_id) = album_ids.get(album_name) {
+                        if let Some(actual_local_id) = result.local_identifier.as_deref() {
+                            match importer::add_to_album(album_id, actual_local_id) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    display::print_warning(&format!(
+                                        "Failed to add '{}' to album '{}'",
+                                        filename, album_name
+                                    ));
+                                }
+                                Err(err) => {
+                                    display::print_warning(&format!(
+                                        "Failed to add '{}' to album '{}': {}",
+                                        filename, album_name, err
+                                    ));
+                                }
+                            }
+                        } else {
+                            display::print_warning(&format!(
+                                "No local identifier for '{}'; skipping album assignment",
+                                filename
+                            ));
+                        }
+                    }
+                }
+
                 if verbose {
-                    let local_id = result.local_identifier.as_deref().unwrap_or("unknown");
                     display::print_success(&format!(
                         "[{}/{}] {} -> {}",
                         index + 1,
@@ -396,7 +539,7 @@ fn print_import_summary(summary: &ImportSummary) {
         format!("{}s", secs)
     };
 
-    display::print_info(&format!("Imported: {}", summary.imported));
+    display::print_info(&format!("Imported: {}", summary.imported.len()));
     display::print_info(&format!("Failed: {}", summary.failed.len()));
     display::print_info(&format!("Elapsed: {}", elapsed_str));
 
