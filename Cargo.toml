@@ -1,0 +1,32 @@
+[package]
+name = "photoferry"
+version = "0.1.0"
+edition = "2024"
+description = "Google Photos → iCloud migration CLI. Handles Takeout zips, metadata preservation, and PhotoKit import."
+license = "MIT"
+repository = "https://github.com/terry-li-hm/photoferry"
+homepage = "https://github.com/terry-li-hm/photoferry"
+keywords = ["photos", "migration", "icloud", "google-photos", "macos"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "photoferry"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+owo-colors = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+swift-rs = "1.0"
+
+[build-dependencies]
+swift-rs = { version = "1.0", features = ["build"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

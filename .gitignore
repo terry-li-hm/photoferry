@@ -1,0 +1,7 @@
+/target
+.build/
+.swiftpm/
+*.o
+*.a
+*.dylib
+.DS_Store
