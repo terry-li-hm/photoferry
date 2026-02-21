@@ -4,9 +4,11 @@ mod metadata;
 mod sidecar;
 mod takeout;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "photoferry", version, about = "Google Photos → iCloud migration")]
@@ -30,6 +32,9 @@ enum Commands {
         /// Simulate without importing
         #[arg(long)]
         dry_run: bool,
+        /// Print per-file import results instead of progress bar
+        #[arg(long)]
+        verbose: bool,
     },
     /// Import a single file (for testing)
     Import {
@@ -59,7 +64,12 @@ fn main() -> Result<()> {
             display::print_info("Run 'photoferry --help' for usage");
         }
         Some(Commands::Check) => cmd_check()?,
-        Some(Commands::Run { dir, once, dry_run }) => cmd_run(&dir, once, dry_run)?,
+        Some(Commands::Run {
+            dir,
+            once,
+            dry_run,
+            verbose,
+        }) => cmd_run(&dir, once, dry_run, verbose)?,
         Some(Commands::Import { file, metadata }) => cmd_import(&file, metadata.as_deref())?,
         Some(Commands::Albums { dir }) => cmd_albums(&dir)?,
     }
@@ -83,7 +93,7 @@ fn cmd_check() -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool) -> Result<()> {
+fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool, verbose: bool) -> Result<()> {
     let dir = expand_tilde(dir);
     if dry_run {
         display::print_header(&format!("Dry run — scanning {}", dir.display()));
@@ -100,6 +110,19 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool) -> Result<()> {
     display::print_info(&format!("Found {} zip(s)", zips.len()));
 
     let zips_to_process = if once { &zips[..1] } else { &zips };
+
+    if !dry_run {
+        let access = importer::check_access()?;
+        if !access.authorized {
+            bail!(
+                "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
+                access.status
+            );
+        }
+        display::print_success(&format!("Photos access: {} (authorized)", access.status));
+    }
+
+    let mut total_summary = ImportSummary::default();
 
     for zip_path in zips_to_process {
         display::print_header(&format!(
@@ -120,11 +143,20 @@ fn cmd_run(dir: &PathBuf, once: bool, dry_run: bool) -> Result<()> {
         print_inventory_summary(&inventory);
 
         if !dry_run {
-            display::print_info("Import not yet implemented (Phase 3)");
+            let summary = import_inventory(&inventory, verbose);
+            print_import_summary(&summary);
+            total_summary.merge(&summary);
         }
 
         // Clean up extraction directory
         std::fs::remove_dir_all(&extract_dir)?;
+    }
+
+    // Print totals if multiple zips processed
+    if !dry_run && zips_to_process.len() > 1 {
+        println!();
+        display::print_header("Total across all zips");
+        print_import_summary(&total_summary);
     }
 
     Ok(())
@@ -221,6 +253,158 @@ fn print_inventory_summary(inventory: &takeout::TakeoutInventory) {
     }
     if !inventory.albums.is_empty() {
         display::print_info(&format!("Albums: {}", inventory.albums.join(", ")));
+    }
+}
+
+#[derive(Debug)]
+struct ImportFailure {
+    path: String,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct ImportSummary {
+    imported: usize,
+    failed: Vec<ImportFailure>,
+    elapsed: std::time::Duration,
+}
+
+impl ImportSummary {
+    fn merge(&mut self, other: &ImportSummary) {
+        self.imported += other.imported;
+        self.failed.extend(other.failed.iter().map(|f| ImportFailure {
+            path: f.path.clone(),
+            error: f.error.clone(),
+        }));
+        self.elapsed += other.elapsed;
+    }
+}
+
+fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> ImportSummary {
+    let total = inventory.files.len();
+    let mut summary = ImportSummary::default();
+    let start = Instant::now();
+
+    if total == 0 {
+        display::print_warning("No media files found to import.");
+        return summary;
+    }
+
+    let pb = if verbose {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total as u64);
+        let style = ProgressStyle::with_template("[{bar:40}] {pos}/{len} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("##-");
+        pb.set_style(style);
+        pb
+    };
+
+    for (index, file) in inventory.files.iter().enumerate() {
+        let filename = file
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        pb.set_message(filename.clone());
+
+        let path = match file.path.to_str() {
+            Some(p) => p,
+            None => {
+                let err = "Invalid UTF-8 file path".to_string();
+                summary.failed.push(ImportFailure {
+                    path: file.path.display().to_string(),
+                    error: err.clone(),
+                });
+                if verbose {
+                    display::print_error(&format!(
+                        "[{}/{}] {} — {}",
+                        index + 1,
+                        total,
+                        filename,
+                        err
+                    ));
+                }
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        match importer::import_photo(path, file.metadata.as_ref()) {
+            Ok(result) if result.success => {
+                summary.imported += 1;
+                if verbose {
+                    let local_id = result.local_identifier.as_deref().unwrap_or("unknown");
+                    display::print_success(&format!(
+                        "[{}/{}] {} -> {}",
+                        index + 1,
+                        total,
+                        filename,
+                        local_id
+                    ));
+                }
+            }
+            Ok(result) => {
+                let err = result.error.unwrap_or_else(|| "unknown error".to_string());
+                summary.failed.push(ImportFailure {
+                    path: file.path.display().to_string(),
+                    error: err.clone(),
+                });
+                if verbose {
+                    display::print_error(&format!(
+                        "[{}/{}] {} — {}",
+                        index + 1,
+                        total,
+                        filename,
+                        err
+                    ));
+                }
+            }
+            Err(error) => {
+                let err = error.to_string();
+                summary.failed.push(ImportFailure {
+                    path: file.path.display().to_string(),
+                    error: err.clone(),
+                });
+                if verbose {
+                    display::print_error(&format!(
+                        "[{}/{}] {} — {}",
+                        index + 1,
+                        total,
+                        filename,
+                        err
+                    ));
+                }
+            }
+        }
+
+        pb.inc(1);
+    }
+
+    pb.finish_and_clear();
+    summary.elapsed = start.elapsed();
+    summary
+}
+
+fn print_import_summary(summary: &ImportSummary) {
+    let secs = summary.elapsed.as_secs();
+    let elapsed_str = if secs >= 60 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    };
+
+    display::print_info(&format!("Imported: {}", summary.imported));
+    display::print_info(&format!("Failed: {}", summary.failed.len()));
+    display::print_info(&format!("Elapsed: {}", elapsed_str));
+
+    if !summary.failed.is_empty() {
+        display::print_warning("Failed files:");
+        for failed in &summary.failed {
+            display::print_error(&format!("{} — {}", failed.path, failed.error));
+        }
     }
 }
 
