@@ -1,15 +1,42 @@
 use std::path::{Path, PathBuf};
 
-/// Maximum filename length (in UTF-8 chars) before Google truncates.
 const TRUNCATION_LIMIT: usize = 46;
 
-/// Find the sidecar JSON for a media file from a list of JSON candidates in the same directory.
-/// Runs matchers in priority order, returns first hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarMatchStrength {
+    Strong,
+    Fuzzy,
+}
+
+#[derive(Debug, Clone)]
+pub struct SidecarMatch {
+    pub path: PathBuf,
+    pub strength: SidecarMatchStrength,
+}
+
 pub fn find_sidecar(media: &Path, json_candidates: &[PathBuf]) -> Option<PathBuf> {
+    find_sidecar_with_strength(media, json_candidates).map(|m| m.path)
+}
+
+pub fn find_sidecar_with_strength(media: &Path, json_candidates: &[PathBuf]) -> Option<SidecarMatch> {
     match_fast_track(media, json_candidates)
-        .or_else(|| match_normal(media, json_candidates))
-        .or_else(|| match_forgotten_duplicates(media, json_candidates))
-        .or_else(|| match_edited(media, json_candidates))
+        .map(|p| SidecarMatch { path: p, strength: SidecarMatchStrength::Strong })
+        .or_else(|| match_normal(media, json_candidates)
+            .map(|p| SidecarMatch { path: p, strength: SidecarMatchStrength::Strong }))
+        .or_else(|| match_forgotten_duplicates(media, json_candidates)
+            .map(|p| SidecarMatch { path: p, strength: SidecarMatchStrength::Fuzzy }))
+        .or_else(|| match_edited(media, json_candidates)
+            .map(|p| SidecarMatch { path: p, strength: SidecarMatchStrength::Fuzzy }))
+}
+
+pub fn truncated_media_base(media_name: &str) -> Option<String> {
+    let (media_base, _) = strip_dedup_index(media_name);
+    let media_char_count = media_base.chars().count();
+    if media_char_count > TRUNCATION_LIMIT {
+        Some(truncate_utf8(&media_base, TRUNCATION_LIMIT))
+    } else {
+        None
+    }
 }
 
 /// Pattern 1: Exact `{filename}.json`
@@ -35,7 +62,9 @@ fn match_normal(media: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
     let (media_base, media_dedup) = strip_dedup_index(media_name);
 
     for candidate in candidates {
-        let cand_name = candidate.file_name().and_then(|f| f.to_str())?;
+        let Some(cand_name) = candidate.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
 
         // Must end with .json
         let Some(without_json) = cand_name.strip_suffix(".json") else {
@@ -80,7 +109,9 @@ fn match_forgotten_duplicates(media: &Path, candidates: &[PathBuf]) -> Option<Pa
     let media_name = media.file_name()?.to_str()?;
 
     for candidate in candidates {
-        let cand_name = candidate.file_name().and_then(|f| f.to_str())?;
+        let Some(cand_name) = candidate.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
         let Some(without_json) = cand_name.strip_suffix(".json") else {
             continue;
         };
@@ -104,15 +135,22 @@ fn match_edited(media: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
     let media_stem = media.file_stem()?.to_str()?;
 
     for candidate in candidates {
-        let cand_name = candidate.file_name().and_then(|f| f.to_str())?;
+        let Some(cand_name) = candidate.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
         let Some(without_json) = cand_name.strip_suffix(".json") else {
             continue;
         };
         let json_base = strip_supplemental_suffix(without_json);
         let json_stem = strip_last_extension(json_base);
 
-        if !json_stem.is_empty() && media_stem.starts_with(json_stem) && media_stem != json_stem {
-            return Some(candidate.clone());
+        if !json_stem.is_empty() && media_stem != json_stem {
+            let edited_suffixes = ["-edited", "_edited", "-bearbeitet", "_bearbeitet"];
+            for suffix in edited_suffixes {
+                if media_stem == format!("{json_stem}{suffix}") {
+                    return Some(candidate.clone());
+                }
+            }
         }
     }
 
@@ -345,6 +383,15 @@ mod tests {
             find_sidecar(Path::new("photo_edited.jpg"), &candidates),
             Some(pb("photo.jpg.json"))
         );
+    }
+
+    #[test]
+    fn test_find_sidecar_with_strength_fuzzy() {
+        let candidates = pbs(&["photo.jpg.json"]);
+        let matched = find_sidecar_with_strength(Path::new("photo-edited.jpg"), &candidates)
+            .expect("match");
+        assert_eq!(matched.path, pb("photo.jpg.json"));
+        assert_eq!(matched.strength, SidecarMatchStrength::Fuzzy);
     }
 
     // -- no match --

@@ -71,11 +71,7 @@ impl DownloadProgress {
 
 fn progress_path(dir: &Path, job_id: &str) -> PathBuf {
     // Keep a readable prefix and add a hash to avoid collisions across jobs.
-    let prefix = if job_id.len() >= 8 {
-        &job_id[..8]
-    } else {
-        job_id
-    };
+    let prefix: String = job_id.chars().take(8).collect();
     let mut hasher = Sha1::new();
     hasher.update(job_id.as_bytes());
     let digest = hasher.finalize();
