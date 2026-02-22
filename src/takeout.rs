@@ -32,6 +32,7 @@ pub struct MediaFile {
 pub struct TakeoutInventory {
     pub files: Vec<MediaFile>,
     pub albums: Vec<String>,
+    #[allow(dead_code)]
     pub stats: InventoryStats,
 }
 
@@ -71,7 +72,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mts", "m2ts", "vob", "ogv", "ogg", "dv", "mod", "tod",
 ];
 
-fn classify_extension(ext: &str) -> Option<MediaType> {
+pub(crate) fn classify_extension(ext: &str) -> Option<MediaType> {
     let ext_lower = ext.to_ascii_lowercase();
     if PHOTO_EXTENSIONS.contains(&ext_lower.as_str()) {
         Some(MediaType::Photo)
@@ -317,11 +318,11 @@ pub fn scan_directory(root: &Path, options: &ScanOptions) -> Result<TakeoutInven
 
 // MARK: - Directory content collection
 
-struct DirectoryEntries {
-    all_files: Vec<PathBuf>,
-    media_files: Vec<PathBuf>,
-    json_files: Vec<PathBuf>,
-    unknown_files: Vec<PathBuf>,
+pub(crate) struct DirectoryEntries {
+    pub(crate) all_files: Vec<PathBuf>,
+    pub(crate) media_files: Vec<PathBuf>,
+    pub(crate) json_files: Vec<PathBuf>,
+    pub(crate) unknown_files: Vec<PathBuf>,
 }
 
 /// Walk the directory tree and group files by their parent directory.
@@ -366,7 +367,7 @@ fn collect_directory_contents(root: &Path) -> Result<HashMap<PathBuf, DirectoryE
 // MARK: - Album detection
 
 /// Check if a directory is an album folder by looking for a `metadata.json` with album data.
-fn detect_album(_dir: &Path, json_files: &[PathBuf]) -> Option<String> {
+pub(crate) fn detect_album(_dir: &Path, json_files: &[PathBuf]) -> Option<String> {
     // First check: directory-level metadata.json
     let metadata_path = json_files
         .iter()
@@ -378,7 +379,7 @@ fn detect_album(_dir: &Path, json_files: &[PathBuf]) -> Option<String> {
 }
 
 /// Check if directory name matches `Photos from YYYY` pattern — these aren't albums.
-fn is_year_folder(dir: &Path) -> bool {
+pub(crate) fn is_year_folder(dir: &Path) -> bool {
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if let Some(rest) = name.strip_prefix("Photos from ") {
         rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit())
@@ -391,7 +392,7 @@ fn is_year_folder(dir: &Path) -> bool {
 
 /// Match photo + video pairs in the same directory by base filename.
 /// Returns a map from photo path → video path.
-fn detect_live_photo_pairs(media_files: &[PathBuf]) -> HashMap<PathBuf, PathBuf> {
+pub(crate) fn detect_live_photo_pairs(media_files: &[PathBuf]) -> HashMap<PathBuf, PathBuf> {
     let mut pairs = HashMap::new();
     let mut by_stem: HashMap<String, Vec<&PathBuf>> = HashMap::new();
 

@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -305,8 +306,9 @@ fn cmd_run(
     Ok(())
 }
 
-/// Extract, scan, import, and write manifest for a single zip.
-/// Returns ImportSummary (empty if dry_run).
+/// Process a single Takeout zip. Streams directory-by-directory from the ZIP
+/// to avoid extracting the entire archive (peak disk: ~one directory vs full ZIP).
+#[allow(clippy::too_many_arguments)]
 fn process_one_zip(
     zip_path: &Path,
     manifest_dir: &Path,
@@ -317,181 +319,664 @@ fn process_one_zip(
     strict_extensions: bool,
     unknown_report: Option<&Path>,
 ) -> Result<ImportSummary> {
-    let extract_dir = manifest_dir.join(format!(
-        ".photoferry-extract-{}",
-        zip_path.file_stem().unwrap_or_default().to_string_lossy()
-    ));
-    if extract_dir.exists() {
-        display::print_info(&format!(
-            "Cleaning stale extract dir: {}",
-            extract_dir.display()
-        ));
-        std::fs::remove_dir_all(&extract_dir)?;
-    }
-    std::fs::create_dir_all(&extract_dir)?;
+    process_zip_streaming(
+        zip_path,
+        manifest_dir,
+        dry_run,
+        verbose,
+        include_trashed,
+        retry_failed,
+        strict_extensions,
+        unknown_report,
+    )
+}
 
+// MARK: - Streaming ZIP processor
+
+/// Entry metadata collected during Phase 1 (ZIP indexing).
+struct ZipEntry {
+    index: usize,
+    relative_path: String,
+    filename: String,
+    /// false if filtered out by already_imported / retry_failed
+    should_import: bool,
+}
+
+#[derive(Default)]
+struct ZipDirGroup {
+    media: Vec<ZipEntry>,
+    json: Vec<ZipEntry>,
+}
+
+/// Stream-process a ZIP file one directory at a time.
+///
+/// Phase 1: Index all ZIP entries by parent directory (no disk I/O).
+/// Phase 2: For each directory, extract its files to a temp dir, run sidecar
+///           matching / live-photo detection / import, then delete the temp files.
+/// Phase 3: Write merged manifest.
+#[allow(clippy::too_many_arguments)]
+fn process_zip_streaming(
+    zip_path: &Path,
+    manifest_dir: &Path,
+    dry_run: bool,
+    verbose: bool,
+    include_trashed: bool,
+    retry_failed: bool,
+    strict_extensions: bool,
+    unknown_report: Option<&Path>,
+) -> Result<ImportSummary> {
     let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
     let zip_name = zip_path.file_name().unwrap_or_default().to_string_lossy();
     let manifest_path = manifest_dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
+    let tmp_dir = manifest_dir.join(".photoferry-stream-tmp");
 
-    let content_root = match takeout::extract_zip(zip_path, &extract_dir) {
-        Ok(root) => root,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            return Err(e.context("Failed to extract zip"));
-        }
-    };
-    let mut inventory = match takeout::scan_directory(
-        &content_root,
-        &takeout::ScanOptions { include_trashed },
-    ) {
-        Ok(inv) => inv,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            return Err(e.context("Failed to scan extracted content"));
-        }
-    };
+    // Load existing manifest for resume / retry filtering
+    let existing_manifest = manifest::read_manifest_strict(&manifest_path).with_context(|| {
+        format!(
+            "Refusing to continue with corrupt manifest {}",
+            manifest_path.display()
+        )
+    })?;
 
-    let existing_manifest = match manifest::read_manifest_strict(&manifest_path) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            return Err(e.context(format!(
-                "Refusing to continue with corrupt manifest {}",
-                manifest_path.display()
-            )));
-        }
-    };
     let already_imported: HashSet<String> = existing_manifest
         .as_ref()
         .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
         .unwrap_or_default();
+
+    let failed_paths: HashSet<String> = if retry_failed {
+        existing_manifest
+            .as_ref()
+            .map(|m| m.failed.iter().map(|e| e.path.clone()).collect())
+            .unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+
+    if retry_failed && failed_paths.is_empty() {
+        display::print_info("No previously-failed files to retry.");
+        return Ok(ImportSummary::default());
+    }
     if dry_run && !already_imported.is_empty() {
         display::print_info(&format!(
             "{} already imported (skipping)",
             already_imported.len()
         ));
     }
-    if !already_imported.is_empty() {
-        inventory.files.retain(|file| {
-            let relative = file
-                .path
-                .strip_prefix(&content_root)
-                .unwrap_or(&file.path)
-                .to_string_lossy()
-                .to_string();
-            !already_imported.contains(&relative)
-        });
-    }
-    if retry_failed {
-        let failed_paths: HashSet<String> = existing_manifest
-            .as_ref()
-            .map(|m| m.failed.iter().map(|e| e.path.clone()).collect())
-            .unwrap_or_default();
-        if failed_paths.is_empty() {
-            display::print_info("No previously-failed files to retry.");
-            let _ = std::fs::remove_dir_all(&extract_dir);
-            return Ok(ImportSummary::default());
+
+    // ── Phase 1: Index ZIP entries by directory ──────────────────────────
+
+    let file = std::fs::File::open(zip_path)
+        .with_context(|| format!("Cannot open ZIP: {}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(BufReader::new(file))
+        .with_context(|| format!("Invalid ZIP: {}", zip_path.display()))?;
+
+    // Detect "Takeout/" wrapper prefix
+    let content_prefix = {
+        let mut prefix = String::new();
+        for i in 0..archive.len().min(20) {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                if !entry.is_dir() && entry.name().starts_with("Takeout/") {
+                    prefix = "Takeout/".to_string();
+                    break;
+                }
+            }
         }
-        display::print_info(&format!(
-            "Retrying {} previously-failed files",
-            failed_paths.len()
-        ));
-        inventory.files.retain(|file| {
-            let relative = file
-                .path
-                .strip_prefix(&content_root)
-                .unwrap_or(&file.path)
-                .to_string_lossy()
-                .to_string();
-            failed_paths.contains(&relative)
-        });
+        prefix
+    };
+
+    let mut dirs: HashMap<String, ZipDirGroup> = HashMap::new();
+    let mut unknown_stats = takeout::InventoryStats::default();
+    let mut total_photos = 0usize;
+    let mut total_videos = 0usize;
+    let mut total_to_process = 0usize;
+
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let entry_path = entry.name().to_string();
+        let entry_size = entry.size();
+        drop(entry); // release borrow
+
+        let relative = entry_path
+            .strip_prefix(&content_prefix)
+            .unwrap_or(&entry_path)
+            .to_string();
+
+        let path = Path::new(&relative);
+        let dir_key = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Some(fname) = path.file_name() else {
+            continue;
+        };
+        let filename = fname.to_string_lossy().to_string();
+        let ext = Path::new(&filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        if ext == "json" {
+            dirs.entry(dir_key).or_default().json.push(ZipEntry {
+                index: i,
+                relative_path: relative,
+                filename,
+                should_import: false, // JSON entries are never directly imported
+            });
+        } else if let Some(media_type) = takeout::classify_extension(&ext) {
+            // Always count for summary stats
+            match media_type {
+                takeout::MediaType::Photo => total_photos += 1,
+                takeout::MediaType::Video => total_videos += 1,
+            }
+            // Determine whether this file should be imported
+            let dominated = already_imported.contains(&relative)
+                || (retry_failed && !failed_paths.contains(&relative));
+            if !dominated {
+                total_to_process += 1;
+            }
+            // Always add to the group (needed for live-photo pair detection even
+            // when the file itself is already imported)
+            dirs.entry(dir_key).or_default().media.push(ZipEntry {
+                index: i,
+                relative_path: relative,
+                filename,
+                should_import: !dominated,
+            });
+        } else {
+            unknown_stats.unknown_extensions += 1;
+            if unknown_stats.unknown_examples.len() < 5 {
+                unknown_stats.unknown_examples.push(relative.clone());
+            }
+            unknown_stats.unknown_files.push(takeout::UnknownFile {
+                path: PathBuf::from(&relative),
+                ext,
+                size_bytes: entry_size,
+            });
+        }
     }
 
-    print_inventory_summary(&inventory);
-    if let Some(report_path) = unknown_report {
-        write_unknown_report(report_path, zip_name.as_ref(), &inventory.stats.unknown_files)?;
+    // Phase 1 summary
+    display::print_info(&format!("Photos: {}", total_photos));
+    display::print_info(&format!("Videos: {}", total_videos));
+    if !already_imported.is_empty() {
+        display::print_info(&format!(
+            "Already imported: {} (skipping)",
+            already_imported.len()
+        ));
     }
-    if strict_extensions && inventory.stats.unknown_extensions > 0 {
-        let examples = if inventory.stats.unknown_examples.is_empty() {
+    if unknown_stats.unknown_extensions > 0 {
+        display::print_warning(&format!(
+            "Unknown extensions (skipped): {}",
+            unknown_stats.unknown_extensions
+        ));
+        if !unknown_stats.unknown_examples.is_empty() {
+            display::print_info(&format!(
+                "Examples: {}",
+                unknown_stats.unknown_examples.join(", ")
+            ));
+        }
+    }
+
+    if let Some(report_path) = unknown_report {
+        write_unknown_report(report_path, zip_name.as_ref(), &unknown_stats.unknown_files)?;
+    }
+    if strict_extensions && unknown_stats.unknown_extensions > 0 {
+        let examples = if unknown_stats.unknown_examples.is_empty() {
             "<none>".to_string()
         } else {
-            inventory.stats.unknown_examples.join(", ")
+            unknown_stats.unknown_examples.join(", ")
         };
-        let _ = std::fs::remove_dir_all(&extract_dir);
         return Err(anyhow::anyhow!(format!(
             "{STRICT_EXTENSIONS_ABORT}: Unknown extensions detected ({}). Examples: {}. Re-run without --strict-extensions to proceed.",
-            inventory.stats.unknown_extensions,
-            examples
+            unknown_stats.unknown_extensions, examples
         )));
     }
-
     if dry_run {
-        let _ = std::fs::remove_dir_all(&extract_dir);
+        return Ok(ImportSummary::default());
+    }
+    if total_to_process == 0 {
+        display::print_warning("No media files to import.");
         return Ok(ImportSummary::default());
     }
 
-    let summary = import_inventory(&inventory, verbose);
+    // ── Phase 2: Process each directory ──────────────────────────────────
 
-    let new_imported: Vec<(String, String, Option<String>, bool)> = summary
-        .imported
-        .iter()
-        .map(|file| {
-            (
-                file.path
-                    .strip_prefix(&content_root)
-                    .unwrap_or(&file.path)
-                    .to_string_lossy()
-                    .to_string(),
-                file.local_id.clone(),
-                file.creation_date.clone(),
-                file.is_live_photo,
+    // Clean stale temp dir
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+
+    let start = Instant::now();
+    let mut summary = ImportSummary::default();
+    let mut album_ids: HashMap<String, String> = HashMap::new();
+    let mut all_imported: Vec<(String, String, Option<String>, bool)> = Vec::new();
+    let mut all_failed: Vec<(String, String)> = Vec::new();
+    let mut all_live_fallbacks: Vec<(String, String, String)> = Vec::new();
+
+    let pb = if verbose {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(total_to_process as u64);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "[{bar:40}] {pos}/{len} {per_sec:.1}/s ETA {eta} {msg}",
             )
-        })
-        .collect();
-    let new_failed: Vec<(String, String)> = summary
-        .failed
-        .iter()
-        .map(|file| {
-            let p = std::path::Path::new(&file.path);
-            (
-                p.strip_prefix(&content_root)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .to_string(),
-                file.error.clone(),
-            )
-        })
-        .collect();
-    let new_live_fallbacks: Vec<(String, String, String)> = summary
-        .live_photo_fallback_entries
-        .iter()
-        .map(|entry| {
-            let photo_rel = entry
-                .photo_path
-                .strip_prefix(&content_root)
-                .unwrap_or(&entry.photo_path)
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("##-"),
+        );
+        pb
+    };
+
+    let mut dir_keys: Vec<String> = dirs.keys().cloned().collect();
+    dir_keys.sort();
+
+    for dir_key in &dir_keys {
+        let group = dirs.get(dir_key).unwrap();
+        // Skip directories with no importable media
+        if !group.media.iter().any(|e| e.should_import) {
+            continue;
+        }
+
+        // Create temp subdirectory matching the original structure
+        let extract_dir = if dir_key.is_empty() {
+            tmp_dir.clone()
+        } else {
+            tmp_dir.join(dir_key)
+        };
+        std::fs::create_dir_all(&extract_dir)?;
+
+        // Extract JSON sidecars
+        let mut json_paths = Vec::new();
+        for je in &group.json {
+            let dest = extract_dir.join(&je.filename);
+            let mut zf = archive.by_index(je.index)?;
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut zf, &mut out)?;
+            json_paths.push(dest);
+        }
+
+        // Extract ALL media (including already-imported, needed for live-pair detection)
+        struct ExtractedMedia {
+            disk_path: PathBuf,
+            relative_path: String,
+            should_import: bool,
+        }
+        let mut media_map: Vec<ExtractedMedia> = Vec::new();
+        for me in &group.media {
+            let dest = extract_dir.join(&me.filename);
+            let mut zf = archive.by_index(me.index)?;
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut zf, &mut out)?;
+            media_map.push(ExtractedMedia {
+                disk_path: dest,
+                relative_path: me.relative_path.clone(),
+                should_import: me.should_import,
+            });
+        }
+
+        // ── Per-directory analysis (mirrors scan_directory logic) ────────
+
+        // Album detection
+        let dir_path = Path::new(dir_key);
+        let album = takeout::detect_album(dir_path, &json_paths);
+        let is_year = takeout::is_year_folder(dir_path);
+        let effective_album = if is_year { None } else { album };
+
+        // Ensure album exists in Photos.app
+        if let Some(ref album_name) = effective_album {
+            if !album_ids.contains_key(album_name) {
+                match importer::create_album(album_name) {
+                    Ok(id) => {
+                        album_ids.insert(album_name.clone(), id);
+                    }
+                    Err(e) => {
+                        display::print_warning(&format!(
+                            "Failed to create album '{}': {}",
+                            album_name, e
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Sidecar candidates
+        let all_disk_files: Vec<PathBuf> = json_paths
+            .iter()
+            .chain(media_map.iter().map(|m| &m.disk_path))
+            .cloned()
+            .collect();
+        let json_candidates = sidecar::collect_json_candidates(&all_disk_files);
+
+        // Live Photo pairs (uses ALL media files including already-imported)
+        let disk_media_paths: Vec<PathBuf> =
+            media_map.iter().map(|m| m.disk_path.clone()).collect();
+        let live_pairs = takeout::detect_live_photo_pairs(&disk_media_paths);
+
+        // Truncation collision detection
+        let mut truncation_counts: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for em in &media_map {
+            let name = em
+                .disk_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if let Some(trunc) = sidecar::truncated_media_base(name) {
+                truncation_counts
+                    .entry(trunc)
+                    .or_default()
+                    .push(em.disk_path.clone());
+            }
+        }
+        let ambiguous_truncations: HashSet<String> = truncation_counts
+            .iter()
+            .filter(|(_, v)| v.len() > 1)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        // ── Import each media file ──────────────────────────────────────
+
+        for em in &media_map {
+            // Skip already-imported (they were extracted only for live-pair detection)
+            if !em.should_import {
+                continue;
+            }
+
+            let filename = em
+                .disk_path
+                .file_name()
+                .unwrap_or_default()
                 .to_string_lossy()
-                .to_string();
-            let video_rel = entry
-                .video_path
-                .strip_prefix(&content_root)
-                .unwrap_or(&entry.video_path)
-                .to_string_lossy()
-                .to_string();
-            (photo_rel, video_rel, entry.local_id.clone())
-        })
-        .collect();
-    let write_result = manifest::merge_and_write(
+                .into_owned();
+            pb.set_message(filename.clone());
+
+            let ext = em
+                .disk_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let Some(media_type) = takeout::classify_extension(ext) else {
+                pb.inc(1);
+                continue;
+            };
+
+            // Skip videos that are Live Photo pair components
+            if media_type == takeout::MediaType::Video
+                && live_pairs.values().any(|v| v == &em.disk_path)
+            {
+                // Not counted in total_to_process, so don't increment pb
+                continue;
+            }
+
+            // Sidecar matching
+            let sidecar_match = if sidecar::truncated_media_base(&filename)
+                .as_ref()
+                .is_some_and(|t| ambiguous_truncations.contains(t))
+            {
+                None // truncation collision — skip sidecar
+            } else {
+                sidecar::find_sidecar_with_strength(&em.disk_path, &json_candidates)
+            };
+
+            let sidecar_path = sidecar_match.as_ref().map(|m| m.path.clone());
+            let sidecar_strength = sidecar_match.as_ref().map(|m| m.strength);
+            let takeout_meta = sidecar_path.as_ref().and_then(|sp| {
+                let bytes = std::fs::read(sp).ok()?;
+                metadata::parse_sidecar(&bytes).ok()
+            });
+
+            // Trashed check
+            let is_trashed = takeout_meta.as_ref().is_some_and(|m| m.is_trashed());
+            let is_strong =
+                sidecar_strength == Some(sidecar::SidecarMatchStrength::Strong);
+            if is_trashed && is_strong && !include_trashed {
+                pb.inc(1);
+                continue;
+            }
+
+            let photo_metadata = takeout_meta.as_ref().map(|m| m.to_photo_metadata());
+
+            let live_photo_pair = if media_type == takeout::MediaType::Photo {
+                live_pairs.get(&em.disk_path).cloned()
+            } else {
+                None
+            };
+
+            // Import the file
+            let path_str = match em.disk_path.to_str() {
+                Some(p) => p,
+                None => {
+                    let err = "Invalid UTF-8 file path".to_string();
+                    summary.failed.push(ImportFailure {
+                        path: em.relative_path.clone(),
+                        error: err.clone(),
+                    });
+                    all_failed.push((em.relative_path.clone(), err));
+                    pb.inc(1);
+                    continue;
+                }
+            };
+
+            let mut used_live_fallback = false;
+            let import_result = if let Some(ref video_disk) = live_photo_pair {
+                let live_result = match video_disk.to_str() {
+                    Some(vstr) => {
+                        importer::import_live_photo(path_str, vstr, photo_metadata.as_ref())
+                    }
+                    None => Err(anyhow::anyhow!("Invalid UTF-8 in Live Photo video path")),
+                };
+                match live_result {
+                    Ok(r) if r.success => Ok(r),
+                    Ok(r) => {
+                        let live_err = r
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "Live Photo import failed".to_string());
+                        match importer::import_photo(path_str, photo_metadata.as_ref(), false) {
+                            Ok(fb) if fb.success => {
+                                used_live_fallback = true;
+                                Ok(fb)
+                            }
+                            Ok(fb) => {
+                                let fb_err = fb
+                                    .error
+                                    .unwrap_or_else(|| "Fallback failed".to_string());
+                                Ok(importer::ImportResult {
+                                    success: false,
+                                    local_identifier: None,
+                                    error: Some(format!(
+                                        "Live Photo failed ({live_err}); fallback failed ({fb_err})"
+                                    )),
+                                })
+                            }
+                            Err(e) => Err(anyhow::anyhow!(
+                                "Live Photo failed ({live_err}); fallback error: {e}"
+                            )),
+                        }
+                    }
+                    Err(err) => {
+                        match importer::import_photo(path_str, photo_metadata.as_ref(), false) {
+                            Ok(fb) if fb.success => {
+                                used_live_fallback = true;
+                                Ok(fb)
+                            }
+                            Ok(fb) => {
+                                let fb_err = fb
+                                    .error
+                                    .unwrap_or_else(|| "Fallback failed".to_string());
+                                Ok(importer::ImportResult {
+                                    success: false,
+                                    local_identifier: None,
+                                    error: Some(format!(
+                                        "Live Photo error ({err}); fallback failed ({fb_err})"
+                                    )),
+                                })
+                            }
+                            Err(e) => Err(anyhow::anyhow!(
+                                "Live Photo error ({err}); fallback error: {e}"
+                            )),
+                        }
+                    }
+                }
+            } else {
+                let is_video = matches!(media_type, takeout::MediaType::Video);
+                importer::import_photo(path_str, photo_metadata.as_ref(), is_video)
+            };
+
+            match import_result {
+                Ok(result) if result.success => {
+                    let Some(local_id) = result.local_identifier.clone() else {
+                        let err =
+                            "import succeeded but no local identifier returned".to_string();
+                        summary.failed.push(ImportFailure {
+                            path: em.relative_path.clone(),
+                            error: err.clone(),
+                        });
+                        all_failed.push((em.relative_path.clone(), err));
+                        pb.inc(1);
+                        continue;
+                    };
+
+                    if used_live_fallback {
+                        summary.live_photo_fallbacks += 1;
+                        if let Some(video_disk) = live_photo_pair.as_ref() {
+                            let video_fname = video_disk
+                                .file_name()
+                                .map(|f| f.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let video_rel = if dir_key.is_empty() {
+                                video_fname
+                            } else {
+                                format!("{}/{}", dir_key, video_fname)
+                            };
+                            summary
+                                .live_photo_fallback_entries
+                                .push(LivePhotoFallback {
+                                    photo_path: PathBuf::from(&em.relative_path),
+                                    video_path: PathBuf::from(&video_rel),
+                                    local_id: local_id.clone(),
+                                });
+                            all_live_fallbacks.push((
+                                em.relative_path.clone(),
+                                video_rel,
+                                local_id.clone(),
+                            ));
+                        }
+                        pb.println(format!(
+                            "  ! Live Photo import failed; imported still photo only: {}",
+                            em.relative_path
+                        ));
+                    }
+
+                    let is_live = live_photo_pair.is_some() && !used_live_fallback;
+                    let creation_date =
+                        photo_metadata.as_ref().and_then(|m| m.creation_date.clone());
+
+                    summary.imported.push(ImportedFile {
+                        path: PathBuf::from(&em.relative_path),
+                        local_id: local_id.clone(),
+                        album: effective_album.clone(),
+                        creation_date: creation_date.clone(),
+                        is_live_photo: is_live,
+                    });
+                    all_imported.push((
+                        em.relative_path.clone(),
+                        local_id.clone(),
+                        creation_date,
+                        is_live,
+                    ));
+
+                    // Album assignment
+                    if let Some(album_name) = effective_album.as_ref()
+                        && let Some(album_id) = album_ids.get(album_name)
+                        && let Some(actual_id) = result.local_identifier.as_deref()
+                    {
+                        match importer::add_to_album(album_id, actual_id) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                pb.println(format!(
+                                    "  ! Failed to add '{}' to album '{}'",
+                                    filename, album_name
+                                ));
+                            }
+                            Err(e) => {
+                                pb.println(format!(
+                                    "  ! Failed to add '{}' to album '{}': {}",
+                                    filename, album_name, e
+                                ));
+                            }
+                        }
+                    }
+
+                    if verbose {
+                        let label = if live_photo_pair.is_some() {
+                            let vname = live_photo_pair
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            format!("{}+{}", filename, vname)
+                        } else {
+                            filename.clone()
+                        };
+                        display::print_success(&format!(
+                            "[{}/{}] {} -> {}",
+                            summary.imported.len(),
+                            total_to_process,
+                            label,
+                            local_id
+                        ));
+                    }
+                }
+                Ok(result) => {
+                    let err = result
+                        .error
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    summary.failed.push(ImportFailure {
+                        path: em.relative_path.clone(),
+                        error: err.clone(),
+                    });
+                    all_failed.push((em.relative_path.clone(), err.clone()));
+                    if verbose {
+                        pb.println(format!("  ! {} — {}", filename, err));
+                    }
+                }
+                Err(error) => {
+                    let err = error.to_string();
+                    summary.failed.push(ImportFailure {
+                        path: em.relative_path.clone(),
+                        error: err.clone(),
+                    });
+                    all_failed.push((em.relative_path.clone(), err.clone()));
+                    if verbose {
+                        pb.println(format!("  ! {} — {}", filename, err));
+                    }
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        // Clean up this directory's files before processing the next
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    pb.finish_and_clear();
+    summary.elapsed = start.elapsed();
+
+    // ── Phase 3: Write manifest ─────────────────────────────────────────
+
+    manifest::merge_and_write(
         &manifest_path,
-        &zip_path.file_name().unwrap_or_default().to_string_lossy(),
-        &new_imported,
-        &new_failed,
-        &new_live_fallbacks,
-    );
+        &zip_name,
+        &all_imported,
+        &all_failed,
+        &all_live_fallbacks,
+    )?;
 
-    let _ = std::fs::remove_dir_all(&extract_dir);
-    write_result?;
     Ok(summary)
 }
 
@@ -787,58 +1272,6 @@ fn cmd_download(
 }
 
 // MARK: - Helpers
-
-fn print_inventory_summary(inventory: &takeout::TakeoutInventory) {
-    let s = &inventory.stats;
-    display::print_info(&format!("Photos: {}", s.photos));
-    display::print_info(&format!("Videos: {}", s.videos));
-    display::print_info(&format!(
-        "Sidecar matched: {} / unmatched: {}",
-        s.with_sidecar, s.without_sidecar
-    ));
-    if s.live_photo_pairs > 0 {
-        display::print_info(&format!("Live Photo pairs: {}", s.live_photo_pairs));
-    }
-    if s.trashed_skipped > 0 {
-        display::print_info(&format!("Trashed (skipped): {}", s.trashed_skipped));
-    }
-    if !s.trashed_fuzzy_warned.is_empty() {
-        display::print_warning(&format!(
-            "Trashed (fuzzy match, imported): {}",
-            s.trashed_fuzzy_warned.len()
-        ));
-        let examples: Vec<String> = s.trashed_fuzzy_warned.iter().take(5).cloned().collect();
-        display::print_info(&format!("Examples: {}", examples.join(", ")));
-    }
-    if s.unknown_extensions > 0 {
-        display::print_warning(&format!(
-            "Unknown extensions (skipped): {}",
-            s.unknown_extensions
-        ));
-        if !s.unknown_examples.is_empty() {
-            display::print_info(&format!(
-                "Examples: {}",
-                s.unknown_examples.join(", ")
-            ));
-        }
-    }
-    if !s.sidecar_truncation_collisions.is_empty() {
-        display::print_warning(&format!(
-            "Sidecar truncation collisions (no metadata): {}",
-            s.sidecar_truncation_collisions.len()
-        ));
-        let examples: Vec<String> = s
-            .sidecar_truncation_collisions
-            .iter()
-            .take(5)
-            .cloned()
-            .collect();
-        display::print_info(&format!("Examples: {}", examples.join(", ")));
-    }
-    if !inventory.albums.is_empty() {
-        display::print_info(&format!("Albums: {}", inventory.albums.join(", ")));
-    }
-}
 
 fn write_unknown_report(
     report_path: &Path,
