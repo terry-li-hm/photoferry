@@ -43,7 +43,6 @@ pub struct InventoryStats {
     pub without_sidecar: usize,
     pub trashed_skipped: usize,
     pub live_photo_pairs: usize,
-    pub duplicates_skipped: usize,
 }
 
 // MARK: - Extension sets
@@ -141,9 +140,6 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
     let mut albums = Vec::new();
     let mut seen_albums = HashSet::new();
 
-    // Dedup tracking: (filename, file_size) → first occurrence path
-    let mut dedup_set: HashSet<(String, u64)> = HashSet::new();
-
     // Group files by directory for efficient sidecar matching
     let dir_contents = collect_directory_contents(root)?;
 
@@ -193,19 +189,6 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
             }
 
             let photo_metadata = takeout_meta.as_ref().map(|m| m.to_photo_metadata());
-
-            // Dedup: same filename + file size = skip
-            let file_name = media_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            let file_size = fs::metadata(media_path).map(|m| m.len()).unwrap_or(0);
-            let dedup_key = (file_name, file_size);
-            if !dedup_set.insert(dedup_key) {
-                stats.duplicates_skipped += 1;
-                continue;
-            }
 
             // Track stats
             match media_type {

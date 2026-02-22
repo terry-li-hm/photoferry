@@ -629,9 +629,6 @@ fn print_inventory_summary(inventory: &takeout::TakeoutInventory) {
     if s.trashed_skipped > 0 {
         display::print_info(&format!("Trashed (skipped): {}", s.trashed_skipped));
     }
-    if s.duplicates_skipped > 0 {
-        display::print_info(&format!("Duplicates (skipped): {}", s.duplicates_skipped));
-    }
     if !inventory.albums.is_empty() {
         display::print_info(&format!("Albums: {}", inventory.albums.join(", ")));
     }
