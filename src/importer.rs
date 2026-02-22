@@ -15,7 +15,7 @@ swift!(fn photoferry_verify_assets(identifiers_json: &SRString) -> SRString);
 
 // MARK: - Types
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhotoMetadata {
     #[serde(rename = "creationDate", skip_serializing_if = "Option::is_none")]
     pub creation_date: Option<String>,

@@ -18,7 +18,7 @@ pub enum MediaType {
     Video,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MediaFile {
     pub path: PathBuf,
     pub media_type: MediaType,
@@ -49,8 +49,8 @@ pub struct InventoryStats {
 // MARK: - Extension sets
 
 const PHOTO_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "raw", "cr2",
-    "nef", "arw", "dng",
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "raw", "cr2", "nef",
+    "arw", "dng",
 ];
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -74,7 +74,8 @@ fn classify_extension(ext: &str) -> Option<MediaType> {
 pub fn find_takeout_zips(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut zips = Vec::new();
 
-    let entries = fs::read_dir(dir).with_context(|| format!("Cannot read directory: {}", dir.display()))?;
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("Cannot read directory: {}", dir.display()))?;
 
     for entry in entries {
         let entry = entry?;
@@ -118,7 +119,8 @@ pub fn extract_zip(zip_path: &Path, dest: &Path) -> Result<PathBuf> {
     let mut archive = zip::ZipArchive::new(reader)
         .with_context(|| format!("Invalid ZIP: {}", zip_path.display()))?;
 
-    archive.extract(dest)
+    archive
+        .extract(dest)
         .with_context(|| format!("Failed to extract ZIP: {}", zip_path.display()))?;
 
     // Google Takeout wraps everything in a `Takeout/` subfolder
@@ -307,10 +309,7 @@ fn detect_album(_dir: &Path, json_files: &[PathBuf]) -> Option<String> {
 
 /// Check if directory name matches `Photos from YYYY` pattern — these aren't albums.
 fn is_year_folder(dir: &Path) -> bool {
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if let Some(rest) = name.strip_prefix("Photos from ") {
         rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit())
     } else {
@@ -400,7 +399,12 @@ mod tests {
 
         let zips = find_takeout_zips(base).unwrap();
         assert_eq!(zips.len(), 2);
-        let first_name = zips[0].file_name().unwrap().to_str().unwrap().to_ascii_lowercase();
+        let first_name = zips[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
         assert!(first_name.contains("takeout"));
     }
 

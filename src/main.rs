@@ -15,7 +15,11 @@ use std::process::Command;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "photoferry", version, about = "Google Photos → iCloud migration")]
+#[command(
+    name = "photoferry",
+    version,
+    about = "Google Photos → iCloud migration"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -63,6 +67,15 @@ enum Commands {
         #[arg(default_value = "~/Downloads")]
         dir: PathBuf,
     },
+    /// Re-import assets that verify as missing from Photos library
+    RetryMissing {
+        /// Directory containing manifests and Takeout zips
+        #[arg(default_value = "~/Downloads")]
+        dir: PathBuf,
+        /// Print per-file import results
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Download Takeout zips from Google, import, and delete
     Download {
         /// Google Takeout job ID
@@ -86,6 +99,9 @@ enum Commands {
         /// Print per-file import results
         #[arg(long)]
         verbose: bool,
+        /// Confirm Photos.app shows iCloud upload queue is complete (for safe zip deletion)
+        #[arg(long)]
+        icloud_confirmed: bool,
     },
 }
 
@@ -111,6 +127,7 @@ fn main() -> Result<()> {
         Some(Commands::Import { file, metadata }) => cmd_import(&file, metadata.as_deref())?,
         Some(Commands::Albums { dir }) => cmd_albums(&dir)?,
         Some(Commands::Verify { dir }) => cmd_verify(&dir)?,
+        Some(Commands::RetryMissing { dir, verbose }) => cmd_retry_missing(&dir, verbose)?,
         Some(Commands::Download {
             job,
             user,
@@ -119,7 +136,17 @@ fn main() -> Result<()> {
             end,
             download_only,
             verbose,
-        }) => cmd_download(&job, &user, &dir, start, end, download_only, verbose)?,
+            icloud_confirmed,
+        }) => cmd_download(
+            &job,
+            &user,
+            &dir,
+            start,
+            end,
+            download_only,
+            verbose,
+            icloud_confirmed,
+        )?,
     }
 
     Ok(())
@@ -298,7 +325,7 @@ fn process_one_zip(
 
     let summary = import_inventory(&inventory, verbose);
 
-    let new_imported: Vec<(String, String, Option<String>)> = summary
+    let new_imported: Vec<(String, String, Option<String>, bool)> = summary
         .imported
         .iter()
         .map(|file| {
@@ -310,6 +337,7 @@ fn process_one_zip(
                     .to_string(),
                 file.local_id.clone(),
                 file.creation_date.clone(),
+                file.is_live_photo,
             )
         })
         .collect();
@@ -417,6 +445,7 @@ fn cmd_download(
     end: usize,
     download_only: bool,
     verbose: bool,
+    icloud_confirmed: bool,
 ) -> Result<()> {
     let dir = expand_tilde(dir);
     std::fs::create_dir_all(&dir)?;
@@ -425,6 +454,11 @@ fn cmd_download(
         "Downloading Takeout parts {start}–{end} → {}",
         dir.display()
     ));
+    if !download_only && !icloud_confirmed {
+        display::print_warning(
+            "iCloud sync is not confirmed. ZIPs will be kept even when local verify passes.",
+        );
+    }
 
     // Check Photos access up front (unless download-only)
     if !download_only {
@@ -444,8 +478,9 @@ fn cmd_download(
     progress.save(&dir)?;
 
     display::print_info("Extracting Chrome cookies...");
-    let cookies = downloader::get_chrome_cookies()
-        .context("Failed to get Chrome cookies — ensure Chrome is running and logged into Google")?;
+    let cookies = downloader::get_chrome_cookies().context(
+        "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
+    )?;
     display::print_success(&format!("Got {} Google cookies", cookies.len()));
 
     let client = downloader::build_client(&cookies)?;
@@ -488,9 +523,7 @@ fn cmd_download(
                 match downloader::download_zip(&client, job_id, user_id, i, &dir) {
                     Ok(p) => p,
                     Err(e2) => {
-                        display::print_error(&format!(
-                            "  [{i:02}] Retry failed: {e2} — skipping"
-                        ));
+                        display::print_error(&format!("  [{i:02}] Retry failed: {e2} — skipping"));
                         progress.mark_failed(i, &dir);
                         total_failed_dl += 1;
                         continue;
@@ -500,10 +533,7 @@ fn cmd_download(
         };
 
         if download_only {
-            display::print_success(&format!(
-                "  [{i:02}] Downloaded → {}",
-                zip_path.display()
-            ));
+            display::print_success(&format!("  [{i:02}] Downloaded → {}", zip_path.display()));
             progress.mark_completed(i, &dir);
             total_imported += 1;
             continue;
@@ -529,6 +559,12 @@ fn cmd_download(
                 } else {
                     // Verify all assets exist in Photos Library before deleting zip
                     if verify_zip_manifest(&zip_path, &dir) {
+                        if !icloud_confirmed {
+                            display::print_warning(&format!(
+                                "  [{i:02}] Verify passed, but iCloud sync not confirmed (--icloud-confirmed not set) — keeping zip"
+                            ));
+                            continue;
+                        }
                         if let Err(e) = std::fs::remove_file(&zip_path) {
                             display::print_warning(&format!(
                                 "  [{i:02}] Verified OK but could not delete zip: {e}"
@@ -613,6 +649,7 @@ struct ImportedFile {
     local_id: String,
     album: Option<String>,
     creation_date: Option<String>,
+    is_live_photo: bool,
 }
 
 #[derive(Debug, Default)]
@@ -630,11 +667,13 @@ impl ImportSummary {
                 local_id: file.local_id.clone(),
                 album: file.album.clone(),
                 creation_date: file.creation_date.clone(),
+                is_live_photo: file.is_live_photo,
             }));
-        self.failed.extend(other.failed.iter().map(|f| ImportFailure {
-            path: f.path.clone(),
-            error: f.error.clone(),
-        }));
+        self.failed
+            .extend(other.failed.iter().map(|f| ImportFailure {
+                path: f.path.clone(),
+                error: f.error.clone(),
+            }));
         self.elapsed += other.elapsed;
     }
 }
@@ -665,11 +704,10 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
         ProgressBar::hidden()
     } else {
         let pb = ProgressBar::new(total as u64);
-        let style = ProgressStyle::with_template(
-            "[{bar:40}] {pos}/{len} {per_sec:.1}/s ETA {eta} {msg}",
-        )
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("##-");
+        let style =
+            ProgressStyle::with_template("[{bar:40}] {pos}/{len} {per_sec:.1}/s ETA {eta} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("##-");
         pb.set_style(style);
         pb
     };
@@ -727,6 +765,7 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     local_id: local_id.clone(),
                     album: file.album.clone(),
                     creation_date: file.metadata.as_ref().and_then(|m| m.creation_date.clone()),
+                    is_live_photo: file.live_photo_pair.is_some(),
                 });
 
                 if let Some(album_name) = file.album.as_ref() {
@@ -867,6 +906,7 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
     let mut total_verified_ok = 0usize;
     let mut total_missing = 0usize;
     let mut total_wrong_date = 0usize;
+    let mut total_live_photo_pair_missing = 0usize;
 
     for manifest_path in &manifests {
         let manifest = match manifest::read_manifest(manifest_path) {
@@ -883,14 +923,21 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
             manifest.imported.len()
         ));
 
-        let ids: Vec<&str> = manifest.imported.iter().map(|e| e.local_id.as_str()).collect();
+        let ids: Vec<&str> = manifest
+            .imported
+            .iter()
+            .map(|e| e.local_id.as_str())
+            .collect();
         let results = importer::verify_assets(&ids)?;
 
-        let result_map: HashMap<&str, &importer::AssetVerifyResult> =
-            results.iter().map(|r| (r.local_identifier.as_str(), r)).collect();
+        let result_map: HashMap<&str, &importer::AssetVerifyResult> = results
+            .iter()
+            .map(|r| (r.local_identifier.as_str(), r))
+            .collect();
 
         let mut missing = vec![];
         let mut wrong_date = vec![];
+        let mut live_pair_missing = vec![];
 
         for entry in &manifest.imported {
             match result_map.get(entry.local_id.as_str()) {
@@ -898,6 +945,10 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
                     missing.push(entry);
                 }
                 Some(result) => {
+                    if entry.is_live_photo == Some(true) && !result.has_paired_video {
+                        live_pair_missing.push(entry);
+                        continue;
+                    }
                     if let (Some(expected), Some(actual)) =
                         (&entry.creation_date, &result.creation_date)
                     {
@@ -924,12 +975,20 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
             ));
             total_wrong_date += 1;
         }
+        for e in &live_pair_missing {
+            display::print_warning(&format!(
+                "LIVE PHOTO PAIR MISSING: {} ({})",
+                e.path, e.local_id
+            ));
+            total_live_photo_pair_missing += 1;
+        }
 
         display::print_info(&format!(
-            "Verified: {} | Missing: {} | Wrong date: {}",
-            manifest.imported.len() - missing.len() - wrong_date.len(),
+            "Verified: {} | Missing: {} | Wrong date: {} | Live pair missing: {}",
+            manifest.imported.len() - missing.len() - wrong_date.len() - live_pair_missing.len(),
             missing.len(),
-            wrong_date.len()
+            wrong_date.len(),
+            live_pair_missing.len()
         ));
     }
 
@@ -942,8 +1001,211 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
     if total_wrong_date > 0 {
         display::print_warning(&format!("Wrong date: {}", total_wrong_date));
     }
-    if total_missing == 0 && total_wrong_date == 0 {
+    if total_live_photo_pair_missing > 0 {
+        display::print_warning(&format!(
+            "Live Photo pair missing: {}",
+            total_live_photo_pair_missing
+        ));
+    }
+    if total_missing == 0 && total_wrong_date == 0 && total_live_photo_pair_missing == 0 {
         display::print_success("All assets verified successfully");
+    }
+
+    Ok(())
+}
+
+fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
+    let dir = expand_tilde(dir);
+    display::print_header(&format!("Retrying missing assets in {}", dir.display()));
+
+    let manifests: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(".photoferry-manifest-") && n.ends_with(".json"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if manifests.is_empty() {
+        display::print_info("No manifests found.");
+        return Ok(());
+    }
+
+    let access = importer::check_access()?;
+    if !access.authorized {
+        bail!("Photos access not authorized");
+    }
+
+    let mut total_reimported = 0usize;
+    let mut total_retry_failed = 0usize;
+    let mut total_missing_unresolved = 0usize;
+
+    for manifest_path in &manifests {
+        let manifest = match manifest::read_manifest(manifest_path) {
+            Some(m) => m,
+            None => {
+                display::print_warning(&format!("Could not read {:?}", manifest_path));
+                continue;
+            }
+        };
+        if manifest.imported.is_empty() {
+            continue;
+        }
+
+        let ids: Vec<&str> = manifest
+            .imported
+            .iter()
+            .map(|e| e.local_id.as_str())
+            .collect();
+        let results = importer::verify_assets(&ids)?;
+        let result_map: HashMap<&str, &importer::AssetVerifyResult> = results
+            .iter()
+            .map(|r| (r.local_identifier.as_str(), r))
+            .collect();
+        let missing_entries: Vec<&manifest::ManifestEntry> = manifest
+            .imported
+            .iter()
+            .filter(|entry| {
+                result_map
+                    .get(entry.local_id.as_str())
+                    .map(|r| !r.found)
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        if missing_entries.is_empty() {
+            display::print_info(&format!("{}: no missing assets", manifest.zip));
+            continue;
+        }
+
+        let zip_path = dir.join(&manifest.zip);
+        if !zip_path.exists() {
+            display::print_warning(&format!(
+                "{}: {} missing assets but zip not found at {}",
+                manifest.zip,
+                missing_entries.len(),
+                zip_path.display()
+            ));
+            total_missing_unresolved += missing_entries.len();
+            continue;
+        }
+
+        display::print_header(&format!(
+            "{}: retrying {} missing assets",
+            manifest.zip,
+            missing_entries.len()
+        ));
+
+        let extract_dir = dir.join(format!(
+            ".photoferry-retry-extract-{}",
+            zip_path.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+        if extract_dir.exists() {
+            std::fs::remove_dir_all(&extract_dir)?;
+        }
+        std::fs::create_dir_all(&extract_dir)?;
+
+        let content_root = takeout::extract_zip(&zip_path, &extract_dir)?;
+        let inventory = takeout::scan_directory(&content_root)?;
+
+        let mut by_relative: HashMap<String, takeout::MediaFile> = HashMap::new();
+        for file in &inventory.files {
+            let rel = file
+                .path
+                .strip_prefix(&content_root)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .to_string();
+            by_relative.insert(rel, file.clone());
+        }
+
+        let mut retry_files = Vec::new();
+        let mut unresolved = 0usize;
+        for entry in &missing_entries {
+            if let Some(file) = by_relative.get(&entry.path) {
+                retry_files.push(file.clone());
+            } else {
+                display::print_warning(&format!(
+                    "Missing in zip content (cannot retry): {}",
+                    entry.path
+                ));
+                unresolved += 1;
+            }
+        }
+
+        if retry_files.is_empty() {
+            total_missing_unresolved += missing_entries.len();
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            continue;
+        }
+
+        let retry_albums: Vec<String> = retry_files
+            .iter()
+            .filter_map(|f| f.album.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let retry_inventory = takeout::TakeoutInventory {
+            files: retry_files,
+            albums: retry_albums,
+            stats: Default::default(),
+        };
+
+        let summary = import_inventory(&retry_inventory, verbose);
+        print_import_summary(&summary);
+
+        let new_imported: Vec<(String, String, Option<String>, bool)> = summary
+            .imported
+            .iter()
+            .map(|file| {
+                (
+                    file.path
+                        .strip_prefix(&content_root)
+                        .unwrap_or(&file.path)
+                        .to_string_lossy()
+                        .to_string(),
+                    file.local_id.clone(),
+                    file.creation_date.clone(),
+                    file.is_live_photo,
+                )
+            })
+            .collect();
+        let new_failed: Vec<(String, String)> = summary
+            .failed
+            .iter()
+            .map(|file| {
+                let p = std::path::Path::new(&file.path);
+                (
+                    p.strip_prefix(&content_root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .to_string(),
+                    file.error.clone(),
+                )
+            })
+            .collect();
+        manifest::merge_and_write(&manifest_path, &manifest.zip, &new_imported, &new_failed)?;
+
+        total_reimported += summary.imported.len();
+        total_retry_failed += summary.failed.len();
+        total_missing_unresolved += unresolved;
+        std::fs::remove_dir_all(&extract_dir)?;
+    }
+
+    println!();
+    display::print_header("Retry missing summary");
+    display::print_info(&format!("Re-imported: {}", total_reimported));
+    if total_retry_failed > 0 {
+        display::print_warning(&format!("Retry import failures: {}", total_retry_failed));
+    }
+    if total_missing_unresolved > 0 {
+        display::print_warning(&format!(
+            "Still unresolved missing assets: {}",
+            total_missing_unresolved
+        ));
     }
 
     Ok(())
@@ -988,16 +1250,36 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
         }
         return true;
     }
-    let ids: Vec<&str> = manifest.imported.iter().map(|e| e.local_id.as_str()).collect();
+    let ids: Vec<&str> = manifest
+        .imported
+        .iter()
+        .map(|e| e.local_id.as_str())
+        .collect();
     match importer::verify_assets(&ids) {
         Ok(results) => {
             let missing = results.iter().filter(|r| !r.found).count();
-            if missing > 0 {
+            let result_map: HashMap<&str, &importer::AssetVerifyResult> = results
+                .iter()
+                .map(|r| (r.local_identifier.as_str(), r))
+                .collect();
+            let live_pair_missing = manifest
+                .imported
+                .iter()
+                .filter(|entry| entry.is_live_photo == Some(true))
+                .filter(|entry| {
+                    result_map
+                        .get(entry.local_id.as_str())
+                        .map(|r| r.found && !r.has_paired_video)
+                        .unwrap_or(false)
+                })
+                .count();
+            if missing > 0 || live_pair_missing > 0 {
                 display::print_warning(&format!(
-                    "  Verify: {}/{} confirmed — {} missing, keeping zip",
-                    results.len() - missing,
+                    "  Verify: {}/{} confirmed — {} missing, {} live pair missing; keeping zip",
+                    results.len() - missing - live_pair_missing,
                     results.len(),
-                    missing
+                    missing,
+                    live_pair_missing
                 ));
                 false
             } else {
