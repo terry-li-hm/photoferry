@@ -9,45 +9,45 @@ use crate::importer::PhotoMetadata;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
-pub struct TakeoutJson {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub photo_taken_time: Option<TimestampField>,
-    pub geo_data_exif: Option<GeoData>,
-    pub geo_data: Option<GeoData>,
-    pub favorited: Option<bool>,
-    pub trashed: Option<bool>,
-    pub archived: Option<bool>,
-    pub people: Option<Vec<Person>>,
-    pub album_data: Option<AlbumData>,
+pub(crate) struct TakeoutJson {
+    pub(crate) title: Option<String>,
+    pub(crate) description: Option<String>,
+    photo_taken_time: Option<TimestampField>,
+    geo_data_exif: Option<GeoData>,
+    geo_data: Option<GeoData>,
+    pub(crate) favorited: Option<bool>,
+    pub(crate) trashed: Option<bool>,
+    pub(crate) archived: Option<bool>,
+    people: Option<Vec<Person>>,
+    pub(crate) album_data: Option<AlbumData>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TimestampField {
-    pub timestamp: String,
+struct TimestampField {
+    timestamp: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct GeoData {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub altitude: f64,
+struct GeoData {
+    latitude: f64,
+    longitude: f64,
+    altitude: f64,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
-pub struct Person {
-    pub name: String,
+struct Person {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AlbumData {
-    pub title: String,
+pub(crate) struct AlbumData {
+    pub(crate) title: String,
 }
 
 // MARK: - Parsing
 
-pub fn parse_sidecar(json_bytes: &[u8]) -> Result<TakeoutJson> {
+pub(crate) fn parse_sidecar(json_bytes: &[u8]) -> Result<TakeoutJson> {
     let parsed: TakeoutJson = serde_json::from_slice(json_bytes)?;
     Ok(parsed)
 }
@@ -55,7 +55,7 @@ pub fn parse_sidecar(json_bytes: &[u8]) -> Result<TakeoutJson> {
 // MARK: - Conversion to PhotoMetadata
 
 impl TakeoutJson {
-    pub fn to_photo_metadata(&self) -> PhotoMetadata {
+    pub(crate) fn to_photo_metadata(&self) -> PhotoMetadata {
         PhotoMetadata {
             creation_date: self.parse_timestamp(),
             latitude: self.best_latitude(),
@@ -67,7 +67,7 @@ impl TakeoutJson {
         }
     }
 
-    pub fn is_trashed(&self) -> bool {
+    pub(crate) fn is_trashed(&self) -> bool {
         self.trashed.unwrap_or(false)
     }
 
