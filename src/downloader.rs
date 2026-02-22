@@ -65,7 +65,11 @@ impl DownloadProgress {
 
 fn progress_path(dir: &Path, job_id: &str) -> PathBuf {
     // Use first 8 chars of job_id for a readable but unique filename
-    let prefix = if job_id.len() >= 8 { &job_id[..8] } else { job_id };
+    let prefix = if job_id.len() >= 8 {
+        &job_id[..8]
+    } else {
+        job_id
+    };
     dir.join(format!(".photoferry-download-{prefix}.json"))
 }
 
@@ -99,12 +103,17 @@ fn derive_aes_key() -> Result<[u8; COOKIES_KEY_LEN]> {
         );
     }
 
-    let password = String::from_utf8(output.stdout)
-        .context("Chrome Safe Storage key is not valid UTF-8")?;
+    let password =
+        String::from_utf8(output.stdout).context("Chrome Safe Storage key is not valid UTF-8")?;
     let password = password.trim();
 
     let mut key = [0u8; COOKIES_KEY_LEN];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(password.as_bytes(), COOKIES_SALT, COOKIES_ITERATIONS, &mut key);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(
+        password.as_bytes(),
+        COOKIES_SALT,
+        COOKIES_ITERATIONS,
+        &mut key,
+    );
     Ok(key)
 }
 
@@ -239,17 +248,17 @@ pub fn download_zip(
     let url = build_url(job_id, user_id, i);
 
     // HEAD to get filename + Content-Length
-    let head = client
-        .head(&url)
-        .send()
-        .context("HEAD request failed")?;
+    let head = client.head(&url).send().context("HEAD request failed")?;
 
     if head.status().is_client_error() {
-        bail!("HEAD {} → {} (auth issue? re-run to refresh cookies)", url, head.status());
+        bail!(
+            "HEAD {} → {} (auth issue? re-run to refresh cookies)",
+            url,
+            head.status()
+        );
     }
 
-    let filename = extract_filename(&head)
-        .unwrap_or_else(|| format!("takeout-part-{i:03}.zip"));
+    let filename = extract_filename(&head).unwrap_or_else(|| format!("takeout-part-{i:03}.zip"));
     let dest = dir.join(&filename);
 
     let content_length = head
@@ -269,7 +278,11 @@ pub fn download_zip(
     }
 
     // Resume from partial
-    let resume_pos = if dest.exists() { dest.metadata()?.len() } else { 0 };
+    let resume_pos = if dest.exists() {
+        dest.metadata()?.len()
+    } else {
+        0
+    };
 
     if resume_pos > 0 {
         println!(
@@ -355,11 +368,7 @@ pub fn download_zip(
 }
 
 fn extract_filename(resp: &reqwest::blocking::Response) -> Option<String> {
-    let cd = resp
-        .headers()
-        .get("content-disposition")?
-        .to_str()
-        .ok()?;
+    let cd = resp.headers().get("content-disposition")?.to_str().ok()?;
     // content-disposition: attachment; filename="takeout-xxx.zip"
     let pos = cd.find("filename=")?;
     let rest = cd[pos + "filename=".len()..].trim_start_matches('"');
