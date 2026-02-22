@@ -23,11 +23,20 @@ pub struct ManifestFailure {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestLivePhotoFallback {
+    pub photo_path: String,
+    pub video_path: String,
+    pub local_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportManifest {
     pub zip: String,
     pub processed_at: String,
     pub imported: Vec<ManifestEntry>,
     pub failed: Vec<ManifestFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_photo_fallbacks: Vec<ManifestLivePhotoFallback>,
 }
 
 /// Read an existing manifest file leniently. Returns None on any error.
@@ -62,6 +71,7 @@ pub fn write_manifest(
     zip_name: &str,
     imported: &[(String, String, Option<String>, bool)], // (relative_path, local_id, creation_date, is_live_photo)
     failed: &[(String, String)],                         // (relative_path, error)
+    live_photo_fallbacks: &[(String, String, String)],   // (photo_path, video_path, local_id)
 ) -> Result<()> {
     let manifest = ImportManifest {
         zip: zip_name.to_string(),
@@ -82,6 +92,14 @@ pub fn write_manifest(
                 error: e.clone(),
             })
             .collect(),
+        live_photo_fallbacks: live_photo_fallbacks
+            .iter()
+            .map(|(photo_path, video_path, local_id)| ManifestLivePhotoFallback {
+                photo_path: photo_path.clone(),
+                video_path: video_path.clone(),
+                local_id: local_id.clone(),
+            })
+            .collect(),
     };
 
     let json = serde_json::to_string_pretty(&manifest)?;
@@ -98,9 +116,11 @@ pub fn merge_and_write(
     zip_name: &str,
     new_imported: &[(String, String, Option<String>, bool)],
     new_failed: &[(String, String)],
+    new_live_photo_fallbacks: &[(String, String, String)],
 ) -> Result<()> {
     let mut imported: Vec<(String, String, Option<String>, bool)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut live_photo_fallbacks: Vec<(String, String, String)> = Vec::new();
 
     if let Some(existing) = read_manifest_strict(path)? {
         imported.extend(existing.imported.into_iter().map(|e| {
@@ -112,6 +132,9 @@ pub fn merge_and_write(
             )
         }));
         failed.extend(existing.failed.into_iter().map(|e| (e.path, e.error)));
+        live_photo_fallbacks.extend(existing.live_photo_fallbacks.into_iter().map(|e| {
+            (e.photo_path, e.video_path, e.local_id)
+        }));
     }
 
     // Remove old failures that succeeded on retry
@@ -131,7 +154,18 @@ pub fn merge_and_write(
     let imported = deduped;
     failed.extend_from_slice(new_failed);
 
-    write_manifest(path, zip_name, &imported, &failed)
+    live_photo_fallbacks.extend_from_slice(new_live_photo_fallbacks);
+    let mut seen_fb = std::collections::HashSet::new();
+    let mut deduped_fb = Vec::new();
+    for entry in live_photo_fallbacks.into_iter().rev() {
+        if seen_fb.insert(entry.0.clone()) {
+            deduped_fb.push(entry);
+        }
+    }
+    deduped_fb.reverse();
+    let live_photo_fallbacks = deduped_fb;
+
+    write_manifest(path, zip_name, &imported, &failed, &live_photo_fallbacks)
 }
 
 #[cfg(test)]
@@ -157,7 +191,7 @@ mod tests {
         ];
         let failed = vec![("corrupt.jpg".to_string(), "bad data".to_string())];
 
-        write_manifest(&path, "takeout-20240101.zip", &imported, &failed).unwrap();
+        write_manifest(&path, "takeout-20240101.zip", &imported, &failed, &[]).unwrap();
 
         let manifest = read_manifest(&path).unwrap();
         assert_eq!(manifest.zip, "takeout-20240101.zip");
@@ -174,10 +208,10 @@ mod tests {
         let path = dir.path().join("manifest.json");
 
         let failed = vec![("retry.jpg".to_string(), "timeout".to_string())];
-        write_manifest(&path, "test.zip", &[], &failed).unwrap();
+        write_manifest(&path, "test.zip", &[], &failed, &[]).unwrap();
 
         let new_imported = vec![("retry.jpg".to_string(), "XYZ789".to_string(), None, false)];
-        merge_and_write(&path, "test.zip", &new_imported, &[]).unwrap();
+        merge_and_write(&path, "test.zip", &new_imported, &[], &[]).unwrap();
 
         let manifest = read_manifest(&path).unwrap();
         assert_eq!(manifest.imported.len(), 1);
@@ -220,6 +254,7 @@ mod tests {
                 },
             ],
             failed: vec![],
+            live_photo_fallbacks: vec![],
         };
 
         let set = already_imported(&manifest);

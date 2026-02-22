@@ -14,7 +14,8 @@ pub struct SidecarMatch {
     pub strength: SidecarMatchStrength,
 }
 
-pub fn find_sidecar(media: &Path, json_candidates: &[PathBuf]) -> Option<PathBuf> {
+#[cfg(test)]
+fn find_sidecar(media: &Path, json_candidates: &[PathBuf]) -> Option<PathBuf> {
     find_sidecar_with_strength(media, json_candidates).map(|m| m.path)
 }
 

@@ -204,7 +204,7 @@ fn decrypt_cookie_value(encrypted: &[u8], key: &[u8; COOKIES_KEY_LEN]) -> Result
 
 // MARK: - HTTP download
 
-pub fn build_url(job_id: &str, user_id: &str, i: usize) -> String {
+fn build_url(job_id: &str, user_id: &str, i: usize) -> String {
     format!("https://takeout.google.com/takeout/download?j={job_id}&i={i}&user={user_id}")
 }
 

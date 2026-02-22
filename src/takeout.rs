@@ -23,8 +23,6 @@ pub struct MediaFile {
     pub path: PathBuf,
     #[allow(dead_code)]
     pub media_type: MediaType,
-    #[allow(dead_code)]
-    pub sidecar: Option<PathBuf>,
     pub metadata: Option<PhotoMetadata>,
     pub album: Option<String>,
     pub live_photo_pair: Option<PathBuf>,
@@ -37,6 +35,13 @@ pub struct TakeoutInventory {
     pub stats: InventoryStats,
 }
 
+#[derive(Debug, Clone)]
+pub struct UnknownFile {
+    pub path: PathBuf,
+    pub ext: String,
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct InventoryStats {
     pub photos: usize,
@@ -45,17 +50,25 @@ pub struct InventoryStats {
     pub without_sidecar: usize,
     pub trashed_skipped: usize,
     pub live_photo_pairs: usize,
+    pub unknown_extensions: usize,
+    pub unknown_examples: Vec<String>,
+    pub unknown_files: Vec<UnknownFile>,
+    pub trashed_fuzzy_warned: Vec<String>,
+    pub sidecar_truncation_collisions: Vec<String>,
 }
 
 // MARK: - Extension sets
 
 const PHOTO_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp", "raw", "cr2", "nef",
-    "arw", "dng",
+    "jpg", "jpeg", "png", "gif", "heic", "heif", "webp", "tiff", "tif", "bmp",
+    // RAW formats
+    "raw", "cr2", "cr3", "nef", "arw", "sr2", "dng", "orf", "rw2", "raf", "srw", "x3f", "3fr",
+    "pef", "mos", "iiq", "erf", "mef", "nrw", "kdc",
 ];
 
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "mp4", "mov", "avi", "m4v", "3gp", "mkv", "mpg", "mpeg", "wmv", "flv", "webm",
+    "mp4", "mov", "avi", "m4v", "3gp", "3g2", "mkv", "mpg", "mpeg", "mpe", "wmv", "flv", "webm",
+    "mts", "m2ts", "vob", "ogv", "ogg", "dv", "mod", "tod",
 ];
 
 fn classify_extension(ext: &str) -> Option<MediaType> {
@@ -67,6 +80,11 @@ fn classify_extension(ext: &str) -> Option<MediaType> {
     } else {
         None
     }
+}
+
+pub fn media_type_from_path(path: &Path) -> Option<MediaType> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    classify_extension(ext)
 }
 
 // MARK: - ZIP discovery
@@ -135,8 +153,13 @@ pub fn extract_zip(zip_path: &Path, dest: &Path) -> Result<PathBuf> {
 
 // MARK: - Directory scanning
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScanOptions {
+    pub include_trashed: bool,
+}
+
 /// Scan an extracted Takeout directory and build an inventory of media files.
-pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
+pub fn scan_directory(root: &Path, options: &ScanOptions) -> Result<TakeoutInventory> {
     let mut stats = InventoryStats::default();
     let mut files = Vec::new();
     let mut albums = Vec::new();
@@ -149,6 +172,28 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
         let album = detect_album(dir_path, &entries.json_files);
         let is_year_folder = is_year_folder(dir_path);
 
+        if !entries.unknown_files.is_empty() {
+            stats.unknown_extensions += entries.unknown_files.len();
+            const MAX_EXAMPLES: usize = 5;
+            for path in &entries.unknown_files {
+                if stats.unknown_examples.len() < MAX_EXAMPLES {
+                    stats.unknown_examples.push(path.display().to_string());
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+                stats.unknown_files.push(UnknownFile {
+                    path: relative_path,
+                    ext,
+                    size_bytes,
+                });
+            }
+        }
+
         if let Some(ref album_name) = album
             && !is_year_folder
             && seen_albums.insert(album_name.clone())
@@ -159,8 +204,25 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
         // Build JSON candidates for this directory
         let json_candidates = sidecar::collect_json_candidates(&entries.all_files);
 
-        // Detect Live Photo pairs in this directory
-        let live_pairs = detect_live_photo_pairs(&entries.media_files);
+    // Detect Live Photo pairs in this directory
+    let live_pairs = detect_live_photo_pairs(&entries.media_files);
+
+    // Detect truncation collisions for very long filenames
+    let mut truncation_counts: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for media_path in &entries.media_files {
+        let media_name = media_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if let Some(truncated) = sidecar::truncated_media_base(media_name) {
+            truncation_counts
+                .entry(truncated)
+                .or_default()
+                .push(media_path.clone());
+        }
+    }
+    let ambiguous_truncations: HashSet<String> = truncation_counts
+        .iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|(k, _)| k.clone())
+        .collect();
 
         for media_path in &entries.media_files {
             let ext = media_path
@@ -177,16 +239,37 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
             }
 
             // Find sidecar and parse metadata
-            let sidecar_path = sidecar::find_sidecar(media_path, &json_candidates);
+            let media_name = media_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let truncated = sidecar::truncated_media_base(media_name);
+            let sidecar_match = if let Some(trunc) = truncated.as_ref()
+                && ambiguous_truncations.contains(trunc)
+            {
+                stats
+                    .sidecar_truncation_collisions
+                    .push(media_path.display().to_string());
+                None
+            } else {
+                sidecar::find_sidecar_with_strength(media_path, &json_candidates)
+            };
+            let sidecar_path = sidecar_match.as_ref().map(|m| m.path.clone());
+            let sidecar_strength = sidecar_match.as_ref().map(|m| m.strength);
             let takeout_meta = sidecar_path.as_ref().and_then(|sp| {
                 let bytes = fs::read(sp).ok()?;
                 metadata::parse_sidecar(&bytes).ok()
             });
 
-            // Skip trashed files
-            if takeout_meta.as_ref().is_some_and(|m| m.is_trashed()) {
-                stats.trashed_skipped += 1;
-                continue;
+            // Skip trashed files unless explicitly included
+            // Only honor trashed flag on strong sidecar matches (fast_track/normal)
+            let is_trashed = takeout_meta.as_ref().is_some_and(|m| m.is_trashed());
+            let is_strong_match = sidecar_strength == Some(sidecar::SidecarMatchStrength::Strong);
+            if is_trashed {
+                if is_strong_match && !options.include_trashed {
+                    stats.trashed_skipped += 1;
+                    continue;
+                } else if !is_strong_match {
+                    // Fuzzy match says trashed — warn but still import
+                    stats.trashed_fuzzy_warned.push(media_path.display().to_string());
+                }
             }
 
             let photo_metadata = takeout_meta.as_ref().map(|m| m.to_photo_metadata());
@@ -216,7 +299,6 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
             files.push(MediaFile {
                 path: media_path.clone(),
                 media_type,
-                sidecar: sidecar_path,
                 metadata: photo_metadata,
                 album: effective_album,
                 live_photo_pair,
@@ -239,6 +321,7 @@ struct DirectoryEntries {
     all_files: Vec<PathBuf>,
     media_files: Vec<PathBuf>,
     json_files: Vec<PathBuf>,
+    unknown_files: Vec<PathBuf>,
 }
 
 /// Walk the directory tree and group files by their parent directory.
@@ -263,6 +346,7 @@ fn collect_directory_contents(root: &Path) -> Result<HashMap<PathBuf, DirectoryE
             all_files: Vec::new(),
             media_files: Vec::new(),
             json_files: Vec::new(),
+            unknown_files: Vec::new(),
         });
 
         dir_entry.all_files.push(path.clone());
@@ -271,6 +355,8 @@ fn collect_directory_contents(root: &Path) -> Result<HashMap<PathBuf, DirectoryE
             dir_entry.json_files.push(path);
         } else if classify_extension(&ext).is_some() {
             dir_entry.media_files.push(path);
+        } else {
+            dir_entry.unknown_files.push(path);
         }
     }
 
@@ -457,7 +543,7 @@ mod tests {
         fs::write(year_dir.join("deleted.jpg"), b"trash").unwrap();
         fs::write(year_dir.join("deleted.jpg.json"), trashed_sidecar).unwrap();
 
-        let inventory = scan_directory(base).unwrap();
+        let inventory = scan_directory(base, &ScanOptions::default()).unwrap();
 
         assert_eq!(inventory.stats.photos, 2); // sunset + beach
         assert_eq!(inventory.stats.with_sidecar, 1); // sunset has sidecar

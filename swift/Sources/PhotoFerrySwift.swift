@@ -85,7 +85,7 @@ public func checkAccess() -> SRString {
 // MARK: - Import Photo
 
 @_cdecl("photoferry_import_photo")
-public func importPhoto(path: SRString, metadataJSON: SRString) -> SRString {
+public func importPhoto(path: SRString, metadataJSON: SRString, isVideo: Bool) -> SRString {
     let filePath = path.toString()
     let fileURL = URL(fileURLWithPath: filePath)
 
@@ -104,11 +104,6 @@ public func importPhoto(path: SRString, metadataJSON: SRString) -> SRString {
     if !metaStr.isEmpty, let data = metaStr.data(using: .utf8) {
         metadata = try? JSONDecoder().decode(PhotoMetadata.self, from: data)
     }
-
-    // Determine media type
-    let ext = fileURL.pathExtension.lowercased()
-    let videoExtensions: Set<String> = ["mp4", "mov", "avi", "m4v", "3gp", "mkv"]
-    let isVideo = videoExtensions.contains(ext)
 
     let semaphore = DispatchSemaphore(value: 0)
     var localIdentifier: String? = nil

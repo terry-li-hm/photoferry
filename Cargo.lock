@@ -1246,7 +1246,6 @@ dependencies = [
  "cbc",
  "chrono",
  "clap",
- "hmac",
  "indicatif",
  "owo-colors",
  "pbkdf2",

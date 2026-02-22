@@ -7,7 +7,7 @@ use swift_rs::{Bool, SRString, swift};
 // MARK: - FFI declarations
 
 swift!(fn photoferry_check_access() -> SRString);
-swift!(fn photoferry_import_photo(path: &SRString, metadata_json: &SRString) -> SRString);
+swift!(fn photoferry_import_photo(path: &SRString, metadata_json: &SRString, is_video: Bool) -> SRString);
 swift!(fn photoferry_import_live_photo(photo_path: &SRString, video_path: &SRString, metadata_json: &SRString) -> SRString);
 swift!(fn photoferry_create_album(title: &SRString) -> SRString);
 swift!(fn photoferry_add_to_album(album_id: &SRString, asset_id: &SRString) -> Bool);
@@ -72,15 +72,16 @@ pub fn check_access() -> Result<AccessResult> {
     Ok(result)
 }
 
-pub fn import_photo(path: &str, metadata: Option<&PhotoMetadata>) -> Result<ImportResult> {
+pub fn import_photo(path: &str, metadata: Option<&PhotoMetadata>, is_video: bool) -> Result<ImportResult> {
     let path_sr: SRString = path.into();
     let meta_json = match metadata {
         Some(m) => serde_json::to_string(m)?,
         None => String::new(),
     };
     let meta_sr: SRString = meta_json.as_str().into();
+    let is_video_sr: Bool = is_video.into();
 
-    let json = unsafe { photoferry_import_photo(&path_sr, &meta_sr) };
+    let json = unsafe { photoferry_import_photo(&path_sr, &meta_sr, is_video_sr) };
     let result: ImportResult = serde_json::from_str(json.as_str())?;
     Ok(result)
 }
