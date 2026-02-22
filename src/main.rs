@@ -173,7 +173,7 @@ fn cmd_check() -> Result<()> {
 }
 
 fn cmd_run(
-    dir: &PathBuf,
+    dir: &Path,
     once: bool,
     dry_run: bool,
     verbose: bool,
@@ -365,7 +365,7 @@ fn process_one_zip(
     Ok(summary)
 }
 
-fn cmd_import(file: &PathBuf, metadata_json: Option<&str>) -> Result<()> {
+fn cmd_import(file: &Path, metadata_json: Option<&str>) -> Result<()> {
     let path = file
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid file path"))?;
@@ -394,7 +394,7 @@ fn cmd_import(file: &PathBuf, metadata_json: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_albums(dir: &PathBuf) -> Result<()> {
+fn cmd_albums(dir: &Path) -> Result<()> {
     let dir = expand_tilde(dir);
     display::print_header(&format!("Scanning albums in {}", dir.display()));
 
@@ -439,7 +439,7 @@ fn cmd_albums(dir: &PathBuf) -> Result<()> {
 fn cmd_download(
     job_id: &str,
     user_id: &str,
-    dir: &PathBuf,
+    dir: &Path,
     start: usize,
     end: usize,
     download_only: bool,
@@ -553,23 +553,27 @@ fn cmd_download(
                 } else {
                     // Verify all assets exist in Photos Library before deleting zip
                     if verify_zip_manifest(&zip_path, &dir) {
-                        if !icloud_confirmed {
-                            display::print_warning(&format!(
-                                "  [{i:02}] Verify passed, but iCloud sync not confirmed (--icloud-confirmed not set) — keeping zip"
-                            ));
-                            continue;
-                        }
-                        if let Err(e) = std::fs::remove_file(&zip_path) {
-                            display::print_warning(&format!(
-                                "  [{i:02}] Verified OK but could not delete zip: {e}"
-                            ));
-                        } else {
-                            display::print_success(&format!(
-                                "  [{i:02}] Verified + deleted {}",
-                                zip_path.file_name().unwrap_or_default().to_string_lossy()
-                            ));
-                        }
                         progress.mark_completed(i, &dir);
+                        match verify_success_action(icloud_confirmed) {
+                            VerifySuccessAction::KeepZipAndMarkCompleted => {
+                                display::print_warning(&format!(
+                                    "  [{i:02}] Verify passed, but iCloud sync not confirmed (--icloud-confirmed not set) — keeping zip (part marked completed)"
+                                ));
+                                continue;
+                            }
+                            VerifySuccessAction::DeleteZipAndMarkCompleted => {
+                                if let Err(e) = std::fs::remove_file(&zip_path) {
+                                    display::print_warning(&format!(
+                                        "  [{i:02}] Verified OK but could not delete zip: {e}"
+                                    ));
+                                } else {
+                                    display::print_success(&format!(
+                                        "  [{i:02}] Verified + deleted {}",
+                                        zip_path.file_name().unwrap_or_default().to_string_lossy()
+                                    ));
+                                }
+                            }
+                        }
                     } else {
                         display::print_warning(&format!(
                             "  [{i:02}] Import OK but verify failed — keeping zip"
@@ -625,6 +629,20 @@ fn print_inventory_summary(inventory: &takeout::TakeoutInventory) {
     }
     if !inventory.albums.is_empty() {
         display::print_info(&format!("Albums: {}", inventory.albums.join(", ")));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifySuccessAction {
+    KeepZipAndMarkCompleted,
+    DeleteZipAndMarkCompleted,
+}
+
+fn verify_success_action(icloud_confirmed: bool) -> VerifySuccessAction {
+    if icloud_confirmed {
+        VerifySuccessAction::DeleteZipAndMarkCompleted
+    } else {
+        VerifySuccessAction::KeepZipAndMarkCompleted
     }
 }
 
@@ -759,30 +777,30 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
                     is_live_photo: file.live_photo_pair.is_some(),
                 });
 
-                if let Some(album_name) = file.album.as_ref() {
-                    if let Some(album_id) = album_ids.get(album_name) {
-                        if let Some(actual_local_id) = result.local_identifier.as_deref() {
-                            match importer::add_to_album(album_id, actual_local_id) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    pb.println(format!(
-                                        "  ! Failed to add '{}' to album '{}'",
-                                        filename, album_name
-                                    ));
-                                }
-                                Err(err) => {
-                                    pb.println(format!(
-                                        "  ! Failed to add '{}' to album '{}': {}",
-                                        filename, album_name, err
-                                    ));
-                                }
+                if let Some(album_name) = file.album.as_ref()
+                    && let Some(album_id) = album_ids.get(album_name)
+                {
+                    if let Some(actual_local_id) = result.local_identifier.as_deref() {
+                        match importer::add_to_album(album_id, actual_local_id) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                pb.println(format!(
+                                    "  ! Failed to add '{}' to album '{}'",
+                                    filename, album_name
+                                ));
                             }
-                        } else {
-                            pb.println(format!(
-                                "  ! No local identifier for '{}'; skipping album assignment",
-                                filename
-                            ));
+                            Err(err) => {
+                                pb.println(format!(
+                                    "  ! Failed to add '{}' to album '{}': {}",
+                                    filename, album_name, err
+                                ));
+                            }
                         }
+                    } else {
+                        pb.println(format!(
+                            "  ! No local identifier for '{}'; skipping album assignment",
+                            filename
+                        ));
                     }
                 }
 
@@ -869,7 +887,7 @@ fn print_import_summary(summary: &ImportSummary) {
     }
 }
 
-fn cmd_verify(dir: &PathBuf) -> Result<()> {
+fn cmd_verify(dir: &Path) -> Result<()> {
     let dir = expand_tilde(dir);
     display::print_header(&format!("Verifying imports in {}", dir.display()));
 
@@ -938,13 +956,16 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
                         live_pair_missing.push(entry);
                         continue;
                     }
-                    if let (Some(expected), Some(actual)) =
-                        (&entry.creation_date, &result.creation_date)
+                    if date_mismatch(entry.creation_date.as_deref(), result.creation_date.as_deref())
                     {
-                        if !dates_match(expected, actual) {
-                            wrong_date.push((entry, actual.clone()));
-                            continue;
-                        }
+                        wrong_date.push((
+                            entry,
+                            result
+                                .creation_date
+                                .clone()
+                                .unwrap_or_else(|| "<missing>".to_string()),
+                        ));
+                        continue;
                     }
                     total_verified_ok += 1;
                 }
@@ -1003,7 +1024,7 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
+fn cmd_retry_missing(dir: &Path, verbose: bool) -> Result<()> {
     let dir = expand_tilde(dir);
     display::print_header(&format!("Retrying missing assets in {}", dir.display()));
 
@@ -1061,12 +1082,7 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
                     if entry.is_live_photo == Some(true) && !result.has_paired_video {
                         return true;
                     }
-                    if let (Some(expected), Some(actual)) =
-                        (&entry.creation_date, &result.creation_date)
-                    {
-                        return !dates_match(expected, actual);
-                    }
-                    false
+                    date_mismatch(entry.creation_date.as_deref(), result.creation_date.as_deref())
                 }
             })
             .collect();
@@ -1182,7 +1198,7 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
                 )
             })
             .collect();
-        manifest::merge_and_write(&manifest_path, &manifest.zip, &new_imported, &new_failed)?;
+        manifest::merge_and_write(manifest_path, &manifest.zip, &new_imported, &new_failed)?;
 
         total_reimported += summary.imported.len();
         total_retry_failed += summary.failed.len();
@@ -1216,6 +1232,16 @@ fn dates_match(a: &str, b: &str) -> bool {
     match (parsed_a, parsed_b) {
         (Some(da), Some(db)) => da == db,
         _ => a.trim() == b.trim(),
+    }
+}
+
+fn date_mismatch(expected: Option<&str>, actual: Option<&str>) -> bool {
+    match expected {
+        None => false,
+        Some(expected_value) => match actual {
+            Some(actual_value) => !dates_match(expected_value, actual_value),
+            None => true,
+        },
     }
 }
 
@@ -1273,9 +1299,10 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
                     if !result.found {
                         return None;
                     }
-                    let expected = entry.creation_date.as_deref()?;
-                    let actual = result.creation_date.as_deref()?;
-                    Some(!dates_match(expected, actual))
+                    Some(date_mismatch(
+                        entry.creation_date.as_deref(),
+                        result.creation_date.as_deref(),
+                    ))
                 })
                 .filter(|is_wrong| *is_wrong)
                 .count();
@@ -1332,17 +1359,17 @@ fn ensure_full_photos_access(access: &importer::AccessResult, action: &str) -> R
 }
 
 fn expand_tilde(path: &Path) -> PathBuf {
-    if let Some(rest) = path.to_str().and_then(|s: &str| s.strip_prefix("~/")) {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = path.to_str().and_then(|s: &str| s.strip_prefix("~/"))
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::dates_match;
+    use super::{VerifySuccessAction, date_mismatch, dates_match, verify_success_action};
 
     #[test]
     fn dates_match_normalizes_timezone() {
@@ -1360,5 +1387,44 @@ mod tests {
     #[test]
     fn dates_match_falls_back_to_trimmed_string() {
         assert!(dates_match("not-a-date ", "not-a-date"));
+    }
+
+    #[test]
+    fn date_mismatch_is_false_without_expected_date() {
+        assert!(!date_mismatch(None, None));
+        assert!(!date_mismatch(None, Some("2026-02-22T10:00:00Z")));
+    }
+
+    #[test]
+    fn date_mismatch_is_true_when_expected_exists_but_actual_missing() {
+        assert!(date_mismatch(Some("2026-02-22T10:00:00Z"), None));
+    }
+
+    #[test]
+    fn date_mismatch_uses_dates_match_when_both_present() {
+        assert!(!date_mismatch(
+            Some("2026-02-22T10:00:00+08:00"),
+            Some("2026-02-22T02:00:00Z")
+        ));
+        assert!(date_mismatch(
+            Some("2026-02-22T10:00:00Z"),
+            Some("2026-02-22T10:00:01Z")
+        ));
+    }
+
+    #[test]
+    fn verify_success_action_keeps_zip_but_marks_completed_without_icloud_confirmation() {
+        assert_eq!(
+            verify_success_action(false),
+            VerifySuccessAction::KeepZipAndMarkCompleted
+        );
+    }
+
+    #[test]
+    fn verify_success_action_deletes_zip_when_icloud_is_confirmed() {
+        assert_eq!(
+            verify_success_action(true),
+            VerifySuccessAction::DeleteZipAndMarkCompleted
+        );
     }
 }
