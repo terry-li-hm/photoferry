@@ -864,7 +864,7 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
         bail!("Photos access not authorized");
     }
 
-    let mut total_verified = 0usize;
+    let mut total_verified_ok = 0usize;
     let mut total_missing = 0usize;
     let mut total_wrong_date = 0usize;
 
@@ -898,14 +898,15 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
                     missing.push(entry);
                 }
                 Some(result) => {
-                    total_verified += 1;
                     if let (Some(expected), Some(actual)) =
                         (&entry.creation_date, &result.creation_date)
                     {
                         if !dates_match(expected, actual) {
                             wrong_date.push((entry, actual.clone()));
+                            continue;
                         }
                     }
+                    total_verified_ok += 1;
                 }
             }
         }
@@ -934,7 +935,7 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
 
     println!();
     display::print_header("Total");
-    display::print_info(&format!("Verified OK: {}", total_verified));
+    display::print_info(&format!("Verified OK: {}", total_verified_ok));
     if total_missing > 0 {
         display::print_error(&format!("Missing: {}", total_missing));
     }
