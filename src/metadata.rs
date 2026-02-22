@@ -8,6 +8,7 @@ use crate::importer::PhotoMetadata;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct TakeoutJson {
     pub title: Option<String>,
     pub description: Option<String>,
@@ -34,6 +35,7 @@ pub struct GeoData {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Person {
     pub name: String,
 }

@@ -21,7 +21,9 @@ pub enum MediaType {
 #[derive(Debug, Clone)]
 pub struct MediaFile {
     pub path: PathBuf,
+    #[allow(dead_code)]
     pub media_type: MediaType,
+    #[allow(dead_code)]
     pub sidecar: Option<PathBuf>,
     pub metadata: Option<PhotoMetadata>,
     pub album: Option<String>,
@@ -147,10 +149,11 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
         let album = detect_album(dir_path, &entries.json_files);
         let is_year_folder = is_year_folder(dir_path);
 
-        if let Some(ref album_name) = album {
-            if !is_year_folder && seen_albums.insert(album_name.clone()) {
-                albums.push(album_name.clone());
-            }
+        if let Some(ref album_name) = album
+            && !is_year_folder
+            && seen_albums.insert(album_name.clone())
+        {
+            albums.push(album_name.clone());
         }
 
         // Build JSON candidates for this directory
@@ -169,10 +172,8 @@ pub fn scan_directory(root: &Path) -> Result<TakeoutInventory> {
             };
 
             // Skip videos that are Live Photo pairs (they'll be attached to the photo)
-            if media_type == MediaType::Video {
-                if live_pairs.values().any(|v| v == media_path) {
-                    continue;
-                }
+            if media_type == MediaType::Video && live_pairs.values().any(|v| v == media_path) {
+                continue;
             }
 
             // Find sidecar and parse metadata

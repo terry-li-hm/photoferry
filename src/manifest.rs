@@ -37,6 +37,7 @@ pub fn read_manifest(path: &Path) -> Option<ImportManifest> {
 }
 
 /// Build a set of already-imported paths from a manifest.
+#[cfg(test)]
 pub fn already_imported(manifest: &ImportManifest) -> HashSet<String> {
     manifest.imported.iter().map(|e| e.path.clone()).collect()
 }

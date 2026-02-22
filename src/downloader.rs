@@ -24,10 +24,10 @@ pub struct DownloadProgress {
 impl DownloadProgress {
     pub fn load(dir: &Path, job_id: &str) -> Self {
         let path = progress_path(dir, job_id);
-        if let Ok(data) = std::fs::read_to_string(&path) {
-            if let Ok(p) = serde_json::from_str::<DownloadProgress>(&data) {
-                return p;
-            }
+        if let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(p) = serde_json::from_str::<DownloadProgress>(&data)
+        {
+            return p;
         }
         DownloadProgress {
             job_id: job_id.to_string(),
@@ -155,10 +155,10 @@ fn read_cookies(db_path: &Path, key: &[u8; COOKIES_KEY_LEN]) -> Result<HashMap<S
     while let Some(row) = rows.next().context("Error reading cookie row")? {
         let name: String = row.get(0)?;
         let encrypted: Vec<u8> = row.get(1)?;
-        if let Ok(value) = decrypt_cookie_value(&encrypted, key) {
-            if !value.is_empty() {
-                cookies.insert(name, value);
-            }
+        if let Ok(value) = decrypt_cookie_value(&encrypted, key)
+            && !value.is_empty()
+        {
+            cookies.insert(name, value);
         }
     }
 
@@ -216,10 +216,10 @@ pub fn build_client(cookies: &HashMap<String, String>) -> Result<Client> {
         .join("; ");
 
     let mut headers = reqwest::header::HeaderMap::new();
-    if !cookie_str.is_empty() {
-        if let Ok(val) = cookie_str.parse::<reqwest::header::HeaderValue>() {
-            headers.insert(reqwest::header::COOKIE, val);
-        }
+    if !cookie_str.is_empty()
+        && let Ok(val) = cookie_str.parse::<reqwest::header::HeaderValue>()
+    {
+        headers.insert(reqwest::header::COOKIE, val);
     }
 
     Client::builder()
@@ -372,9 +372,7 @@ fn extract_filename(resp: &reqwest::blocking::Response) -> Option<String> {
     // content-disposition: attachment; filename="takeout-xxx.zip"
     let pos = cd.find("filename=")?;
     let rest = cd[pos + "filename=".len()..].trim_start_matches('"');
-    let end = rest
-        .find(|c| c == '"' || c == ';' || c == '\n')
-        .unwrap_or(rest.len());
+    let end = rest.find(['"', ';', '\n']).unwrap_or(rest.len());
     let name = rest[..end].trim();
     if name.is_empty() {
         None

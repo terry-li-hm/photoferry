@@ -127,15 +127,15 @@ fn match_edited(media: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
 /// - Media: `photo(1).jpg` → before the extension
 /// - JSON: `photo.jpg(1)` → after the full media filename (before .json which is already stripped)
 fn strip_dedup_index(name: &str) -> (String, Option<u32>) {
-    if let Some(paren_start) = name.rfind('(') {
-        if let Some(paren_end_rel) = name[paren_start..].find(')') {
-            let paren_end = paren_start + paren_end_rel;
-            let inside = &name[paren_start + 1..paren_end];
-            if let Ok(idx) = inside.parse::<u32>() {
-                let before = &name[..paren_start];
-                let after = &name[paren_end + 1..];
-                return (format!("{before}{after}"), Some(idx));
-            }
+    if let Some(paren_start) = name.rfind('(')
+        && let Some(paren_end_rel) = name[paren_start..].find(')')
+    {
+        let paren_end = paren_start + paren_end_rel;
+        let inside = &name[paren_start + 1..paren_end];
+        if let Ok(idx) = inside.parse::<u32>() {
+            let before = &name[..paren_start];
+            let after = &name[paren_end + 1..];
+            return (format!("{before}{after}"), Some(idx));
         }
     }
     (name.to_string(), None)

@@ -128,5 +128,5 @@ pub fn add_to_album(album_id: &str, asset_id: &str) -> Result<bool> {
     let album_sr: SRString = album_id.into();
     let asset_sr: SRString = asset_id.into();
     let success: Bool = unsafe { photoferry_add_to_album(&album_sr, &asset_sr) };
-    Ok(success.into())
+    Ok(success)
 }
