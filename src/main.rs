@@ -156,13 +156,17 @@ fn cmd_check() -> Result<()> {
     display::print_header("Checking Photos.app access...");
     let result = importer::check_access()?;
 
-    if result.authorized {
-        display::print_success(&format!("Photos access: {} (authorized)", result.status));
-    } else {
+    if !result.authorized {
         display::print_error(&format!(
             "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
             result.status
         ));
+    } else if result.status == "limited" {
+        display::print_warning(
+            "Photos access: limited — grant full library access for reliable verify/retry",
+        );
+    } else {
+        display::print_success(&format!("Photos access: {} (authorized)", result.status));
     }
 
     Ok(())
@@ -194,12 +198,7 @@ fn cmd_run(
 
     if !dry_run {
         let access = importer::check_access()?;
-        if !access.authorized {
-            bail!(
-                "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
-                access.status
-            );
-        }
+        ensure_full_photos_access(&access, "import")?;
         display::print_success(&format!("Photos access: {} (authorized)", access.status));
     }
 
@@ -463,12 +462,7 @@ fn cmd_download(
     // Check Photos access up front (unless download-only)
     if !download_only {
         let access = importer::check_access()?;
-        if !access.authorized {
-            bail!(
-                "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
-                access.status
-            );
-        }
+        ensure_full_photos_access(&access, "download/import verify")?;
         display::print_success(&format!("Photos access: {} (authorized)", access.status));
     }
 
@@ -896,9 +890,7 @@ fn cmd_verify(dir: &PathBuf) -> Result<()> {
     }
 
     let access = importer::check_access()?;
-    if !access.authorized {
-        bail!("Photos access not authorized");
-    }
+    ensure_full_photos_access(&access, "verify")?;
 
     let mut total_verified_ok = 0usize;
     let mut total_missing = 0usize;
@@ -1032,9 +1024,7 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
     }
 
     let access = importer::check_access()?;
-    if !access.authorized {
-        bail!("Photos access not authorized");
-    }
+    ensure_full_photos_access(&access, "retry-missing verification")?;
 
     let mut total_reimported = 0usize;
     let mut total_retry_failed = 0usize;
@@ -1062,19 +1052,27 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
             .iter()
             .map(|r| (r.local_identifier.as_str(), r))
             .collect();
-        let missing_entries: Vec<&manifest::ManifestEntry> = manifest
+        let retry_entries: Vec<&manifest::ManifestEntry> = manifest
             .imported
             .iter()
-            .filter(|entry| {
-                result_map
-                    .get(entry.local_id.as_str())
-                    .map(|r| !r.found)
-                    .unwrap_or(true)
+            .filter(|entry| match result_map.get(entry.local_id.as_str()) {
+                None | Some(importer::AssetVerifyResult { found: false, .. }) => true,
+                Some(result) => {
+                    if entry.is_live_photo == Some(true) && !result.has_paired_video {
+                        return true;
+                    }
+                    if let (Some(expected), Some(actual)) =
+                        (&entry.creation_date, &result.creation_date)
+                    {
+                        return !dates_match(expected, actual);
+                    }
+                    false
+                }
             })
             .collect();
 
-        if missing_entries.is_empty() {
-            display::print_info(&format!("{}: no missing assets", manifest.zip));
+        if retry_entries.is_empty() {
+            display::print_info(&format!("{}: no retry-needed assets", manifest.zip));
             continue;
         }
 
@@ -1083,17 +1081,17 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
             display::print_warning(&format!(
                 "{}: {} missing assets but zip not found at {}",
                 manifest.zip,
-                missing_entries.len(),
+                retry_entries.len(),
                 zip_path.display()
             ));
-            total_missing_unresolved += missing_entries.len();
+            total_missing_unresolved += retry_entries.len();
             continue;
         }
 
         display::print_header(&format!(
-            "{}: retrying {} missing assets",
+            "{}: retrying {} assets",
             manifest.zip,
-            missing_entries.len()
+            retry_entries.len()
         ));
 
         let extract_dir = dir.join(format!(
@@ -1121,7 +1119,7 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
 
         let mut retry_files = Vec::new();
         let mut unresolved = 0usize;
-        for entry in &missing_entries {
+        for entry in &retry_entries {
             if let Some(file) = by_relative.get(&entry.path) {
                 retry_files.push(file.clone());
             } else {
@@ -1134,7 +1132,7 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
         }
 
         if retry_files.is_empty() {
-            total_missing_unresolved += missing_entries.len();
+            total_missing_unresolved += retry_entries.len();
             let _ = std::fs::remove_dir_all(&extract_dir);
             continue;
         }
@@ -1209,8 +1207,16 @@ fn cmd_retry_missing(dir: &PathBuf, verbose: bool) -> Result<()> {
 }
 
 fn dates_match(a: &str, b: &str) -> bool {
-    // Compare first 19 chars (YYYY-MM-DDTHH:MM:SS) — ignore timezone/subsecond
-    a.len() >= 19 && b.len() >= 19 && a[..19] == b[..19]
+    let parsed_a = chrono::DateTime::parse_from_rfc3339(a)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let parsed_b = chrono::DateTime::parse_from_rfc3339(b)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    match (parsed_a, parsed_b) {
+        (Some(da), Some(db)) => da == db,
+        _ => a.trim() == b.trim(),
+    }
 }
 
 /// Returns available disk space in GB for the filesystem containing `path`.
@@ -1259,6 +1265,20 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
                 .iter()
                 .map(|r| (r.local_identifier.as_str(), r))
                 .collect();
+            let wrong_date = manifest
+                .imported
+                .iter()
+                .filter_map(|entry| {
+                    let result = result_map.get(entry.local_id.as_str())?;
+                    if !result.found {
+                        return None;
+                    }
+                    let expected = entry.creation_date.as_deref()?;
+                    let actual = result.creation_date.as_deref()?;
+                    Some(!dates_match(expected, actual))
+                })
+                .filter(|is_wrong| *is_wrong)
+                .count();
             let live_pair_missing = manifest
                 .imported
                 .iter()
@@ -1270,12 +1290,13 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
                         .unwrap_or(false)
                 })
                 .count();
-            if missing > 0 || live_pair_missing > 0 {
+            if missing > 0 || live_pair_missing > 0 || wrong_date > 0 {
                 display::print_warning(&format!(
-                    "  Verify: {}/{} confirmed — {} missing, {} live pair missing; keeping zip",
-                    results.len() - missing - live_pair_missing,
+                    "  Verify: {}/{} confirmed — {} missing, {} wrong date, {} live pair missing; keeping zip",
+                    results.len() - missing - wrong_date - live_pair_missing,
                     results.len(),
                     missing,
+                    wrong_date,
                     live_pair_missing
                 ));
                 false
@@ -1294,6 +1315,22 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
     }
 }
 
+fn ensure_full_photos_access(access: &importer::AccessResult, action: &str) -> Result<()> {
+    if !access.authorized {
+        bail!(
+            "Photos access: {} — grant in System Settings > Privacy & Security > Photos",
+            access.status
+        );
+    }
+    if access.status == "limited" {
+        bail!(
+            "Photos access is limited — {} requires full library access for reliable results",
+            action
+        );
+    }
+    Ok(())
+}
+
 fn expand_tilde(path: &Path) -> PathBuf {
     if let Some(rest) = path.to_str().and_then(|s: &str| s.strip_prefix("~/")) {
         if let Ok(home) = std::env::var("HOME") {
@@ -1301,4 +1338,27 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dates_match;
+
+    #[test]
+    fn dates_match_normalizes_timezone() {
+        assert!(dates_match(
+            "2026-02-22T10:00:00+08:00",
+            "2026-02-22T02:00:00Z"
+        ));
+    }
+
+    #[test]
+    fn dates_match_detects_real_difference() {
+        assert!(!dates_match("2026-02-22T10:00:00Z", "2026-02-22T10:00:01Z"));
+    }
+
+    #[test]
+    fn dates_match_falls_back_to_trimmed_string() {
+        assert!(dates_match("not-a-date ", "not-a-date"));
+    }
 }

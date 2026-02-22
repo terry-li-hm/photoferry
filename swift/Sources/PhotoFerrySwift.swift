@@ -326,7 +326,7 @@ public func verifyAssets(identifiersJSON: SRString) -> SRString {
     }
 
     let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime]
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
     let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
 
