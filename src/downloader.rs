@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,18 +24,22 @@ pub struct DownloadProgress {
 }
 
 impl DownloadProgress {
-    pub fn load(dir: &Path, job_id: &str) -> Self {
+    pub fn load(dir: &Path, job_id: &str) -> Result<Self> {
         let path = progress_path(dir, job_id);
-        if let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(p) = serde_json::from_str::<DownloadProgress>(&data)
-        {
-            return p;
-        }
-        DownloadProgress {
-            job_id: job_id.to_string(),
-            user_id: String::new(),
-            completed: Vec::new(),
-            failed: Vec::new(),
+        match std::fs::read_to_string(&path) {
+            Ok(data) => {
+                let parsed = serde_json::from_str::<DownloadProgress>(&data).with_context(|| {
+                    format!("Corrupt download progress JSON at {}", path.display())
+                })?;
+                Ok(parsed)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DownloadProgress {
+                job_id: job_id.to_string(),
+                user_id: String::new(),
+                completed: Vec::new(),
+                failed: Vec::new(),
+            }),
+            Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
         }
     }
 
@@ -65,13 +70,20 @@ impl DownloadProgress {
 }
 
 fn progress_path(dir: &Path, job_id: &str) -> PathBuf {
-    // Use first 8 chars of job_id for a readable but unique filename
+    // Keep a readable prefix and add a hash to avoid collisions across jobs.
     let prefix = if job_id.len() >= 8 {
         &job_id[..8]
     } else {
         job_id
     };
-    dir.join(format!(".photoferry-download-{prefix}.json"))
+    let mut hasher = Sha1::new();
+    hasher.update(job_id.as_bytes());
+    let digest = hasher.finalize();
+    let hash = digest[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    dir.join(format!(".photoferry-download-{prefix}-{hash}.json"))
 }
 
 // MARK: - Chrome cookie extraction
@@ -394,5 +406,26 @@ fn extract_filename(resp: &reqwest::blocking::Response) -> Option<String> {
         None
     } else {
         Some(name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DownloadProgress, progress_path};
+
+    #[test]
+    fn progress_path_is_unique_for_distinct_jobs_with_same_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = progress_path(dir.path(), "abcdefgh-job-one");
+        let p2 = progress_path(dir.path(), "abcdefgh-job-two");
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn load_errors_on_corrupt_progress_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = progress_path(dir.path(), "job-123");
+        std::fs::write(path, "{bad-json").unwrap();
+        assert!(DownloadProgress::load(dir.path(), "job-123").is_err());
     }
 }

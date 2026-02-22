@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -30,10 +30,24 @@ pub struct ImportManifest {
     pub failed: Vec<ManifestFailure>,
 }
 
-/// Read an existing manifest file. Returns None on any error (missing, corrupt, etc).
+/// Read an existing manifest file leniently. Returns None on any error.
+#[cfg(test)]
 pub fn read_manifest(path: &Path) -> Option<ImportManifest> {
     let contents = fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+/// Read an existing manifest file strictly.
+/// Returns Ok(None) when missing, and Err when unreadable/corrupt.
+pub fn read_manifest_strict(path: &Path) -> Result<Option<ImportManifest>> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    };
+    let manifest = serde_json::from_str::<ImportManifest>(&contents)
+        .with_context(|| format!("Corrupt manifest JSON at {}", path.display()))?;
+    Ok(Some(manifest))
 }
 
 /// Build a set of already-imported paths from a manifest.
@@ -88,7 +102,7 @@ pub fn merge_and_write(
     let mut imported: Vec<(String, String, Option<String>, bool)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
 
-    if let Some(existing) = read_manifest(path) {
+    if let Some(existing) = read_manifest_strict(path)? {
         imported.extend(existing.imported.into_iter().map(|e| {
             (
                 e.path,
@@ -127,6 +141,9 @@ mod tests {
     #[test]
     fn test_read_nonexistent() {
         assert!(read_manifest(Path::new("/nonexistent/manifest.json")).is_none());
+        assert!(read_manifest_strict(Path::new("/nonexistent/manifest.json"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -165,6 +182,16 @@ mod tests {
         let manifest = read_manifest(&path).unwrap();
         assert_eq!(manifest.imported.len(), 1);
         assert_eq!(manifest.failed.len(), 0);
+    }
+
+    #[test]
+    fn test_read_manifest_strict_errors_on_corrupt_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, "{not-json").unwrap();
+
+        assert!(read_manifest(&path).is_none());
+        assert!(read_manifest_strict(&path).is_err());
     }
 
     #[test]

@@ -274,7 +274,16 @@ fn process_one_zip(
         }
     };
 
-    let existing_manifest = manifest::read_manifest(&manifest_path);
+    let existing_manifest = match manifest::read_manifest_strict(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err(e.context(format!(
+                "Refusing to continue with corrupt manifest {}",
+                manifest_path.display()
+            )));
+        }
+    };
     let already_imported: HashSet<String> = existing_manifest
         .as_ref()
         .map(|m| m.imported.iter().map(|e| e.path.clone()).collect())
@@ -488,7 +497,7 @@ fn cmd_download(
     }
 
     // Load or create download progress manifest
-    let mut progress = downloader::DownloadProgress::load(&dir, job_id);
+    let mut progress = downloader::DownloadProgress::load(&dir, job_id)?;
     progress.user_id = user_id.to_string();
     progress.save(&dir)?;
 
@@ -951,11 +960,17 @@ fn cmd_verify(dir: &Path) -> Result<()> {
     let mut total_live_photo_pair_missing = 0usize;
 
     for manifest_path in &manifests {
-        let manifest = match manifest::read_manifest(manifest_path) {
-            Some(m) => m,
-            None => {
+        let manifest = match manifest::read_manifest_strict(manifest_path) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
                 display::print_warning(&format!("Could not read {:?}", manifest_path));
                 continue;
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "Refusing to verify with corrupt manifest {}",
+                    manifest_path.display()
+                )));
             }
         };
 
@@ -1087,11 +1102,17 @@ fn cmd_retry_missing(dir: &Path, verbose: bool) -> Result<()> {
     let mut total_missing_unresolved = 0usize;
 
     for manifest_path in &manifests {
-        let manifest = match manifest::read_manifest(manifest_path) {
-            Some(m) => m,
-            None => {
+        let manifest = match manifest::read_manifest_strict(manifest_path) {
+            Ok(Some(m)) => m,
+            Ok(None) => {
                 display::print_warning(&format!("Could not read {:?}", manifest_path));
                 continue;
+            }
+            Err(e) => {
+                return Err(e.context(format!(
+                    "Refusing retry-missing with corrupt manifest {}",
+                    manifest_path.display()
+                )));
             }
         };
         if manifest.imported.is_empty() {
@@ -1312,10 +1333,16 @@ fn available_space_gb(path: &Path) -> Option<u64> {
 fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
     let zip_stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
     let manifest_path = manifest_dir.join(format!(".photoferry-manifest-{}.json", zip_stem));
-    let manifest = match manifest::read_manifest(&manifest_path) {
-        Some(m) => m,
-        None => {
+    let manifest = match manifest::read_manifest_strict(&manifest_path) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
             display::print_warning("  Verify: manifest missing — refusing to delete zip");
+            return false;
+        }
+        Err(e) => {
+            display::print_warning(&format!(
+                "  Verify: manifest unreadable/corrupt ({e}) — refusing to delete zip"
+            ));
             return false;
         }
     };
@@ -1336,42 +1363,38 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
         .collect();
     match importer::verify_assets(&ids) {
         Ok(results) => {
-            let missing = results.iter().filter(|r| !r.found).count();
             let result_map: HashMap<&str, &importer::AssetVerifyResult> = results
                 .iter()
                 .map(|r| (r.local_identifier.as_str(), r))
                 .collect();
-            let wrong_date = manifest
-                .imported
-                .iter()
-                .filter_map(|entry| {
-                    let result = result_map.get(entry.local_id.as_str())?;
-                    if !result.found {
-                        return None;
-                    }
-                    Some(date_mismatch(
-                        entry.creation_date.as_deref(),
-                        result.creation_date.as_deref(),
-                    ))
-                })
-                .filter(|is_wrong| *is_wrong)
-                .count();
-            let live_pair_missing = manifest
-                .imported
-                .iter()
-                .filter(|entry| entry.is_live_photo == Some(true))
-                .filter(|entry| {
-                    result_map
-                        .get(entry.local_id.as_str())
-                        .map(|r| r.found && !r.has_paired_video)
-                        .unwrap_or(false)
-                })
-                .count();
+            let mut missing = 0usize;
+            let mut wrong_date = 0usize;
+            let mut live_pair_missing = 0usize;
+            let mut confirmed = 0usize;
+            for entry in &manifest.imported {
+                let Some(result) = result_map.get(entry.local_id.as_str()) else {
+                    missing += 1;
+                    continue;
+                };
+                if !result.found {
+                    missing += 1;
+                    continue;
+                }
+                if entry.is_live_photo == Some(true) && !result.has_paired_video {
+                    live_pair_missing += 1;
+                    continue;
+                }
+                if date_mismatch(entry.creation_date.as_deref(), result.creation_date.as_deref()) {
+                    wrong_date += 1;
+                    continue;
+                }
+                confirmed += 1;
+            }
             if missing > 0 || live_pair_missing > 0 || wrong_date > 0 {
                 display::print_warning(&format!(
                     "  Verify: {}/{} confirmed — {} missing, {} wrong date, {} live pair missing; keeping zip",
-                    results.len() - missing - wrong_date - live_pair_missing,
-                    results.len(),
+                    confirmed,
+                    manifest.imported.len(),
                     missing,
                     wrong_date,
                     live_pair_missing
@@ -1380,7 +1403,7 @@ fn verify_zip_manifest(zip_path: &Path, manifest_dir: &Path) -> bool {
             } else {
                 display::print_success(&format!(
                     "  Verify: all {} assets confirmed in Photos Library",
-                    results.len()
+                    confirmed
                 ));
                 true
             }
