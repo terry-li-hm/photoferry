@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
+use reqwest::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -299,7 +300,21 @@ pub fn download_zip(
     }
 
     let resp = req.send().context("GET request failed")?;
-    if !resp.status().is_success() {
+    let mut effective_resume_pos = resume_pos;
+    if resume_pos > 0 {
+        match resp.status() {
+            StatusCode::PARTIAL_CONTENT => {}
+            StatusCode::OK => {
+                println!(
+                    "  [{i:02}] Server did not honor Range; restarting download from 0 for {filename}"
+                );
+                effective_resume_pos = 0;
+            }
+            status => {
+                bail!("GET {} resume expected 206/200 → {}", url, status);
+            }
+        }
+    } else if !resp.status().is_success() {
         bail!("GET {} → {}", url, resp.status());
     }
 
@@ -308,11 +323,11 @@ pub fn download_zip(
         .get(reqwest::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
-        .map(|n| n + resume_pos)
+        .map(|n| n + effective_resume_pos)
         .unwrap_or(0);
 
     let pb = ProgressBar::new(total);
-    pb.set_position(resume_pos);
+    pb.set_position(effective_resume_pos);
     pb.set_style(
         ProgressStyle::with_template(
             "  [{bar:40}] {bytes}/{total_bytes} {bytes_per_sec} ETA {eta}",
@@ -324,7 +339,8 @@ pub fn download_zip(
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .append(resume_pos > 0)
+        .truncate(effective_resume_pos == 0)
+        .append(effective_resume_pos > 0)
         .open(&dest)
         .with_context(|| format!("Failed to open {}", dest.display()))?;
     let mut writer = std::io::BufWriter::new(file);

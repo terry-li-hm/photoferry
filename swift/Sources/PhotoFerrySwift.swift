@@ -285,6 +285,19 @@ public func importLivePhoto(photoPath: SRString, videoPath: SRString, metadataJS
 @_cdecl("photoferry_create_album")
 public func createAlbum(title: SRString) -> SRString {
     let albumTitle = title.toString()
+
+    // Idempotent behavior: reuse existing user album with the same title.
+    let fetchOptions = PHFetchOptions()
+    fetchOptions.predicate = NSPredicate(format: "title == %@", albumTitle)
+    let existing = PHAssetCollection.fetchAssetCollections(
+        with: .album,
+        subtype: .any,
+        options: fetchOptions
+    )
+    if let album = existing.firstObject {
+        return SRString("{\"album_id\":\"\(album.localIdentifier)\"}")
+    }
+
     let semaphore = DispatchSemaphore(value: 0)
     var albumIdentifier: String? = nil
     var albumError: String? = nil

@@ -266,7 +266,13 @@ fn process_one_zip(
             return Err(e.context("Failed to extract zip"));
         }
     };
-    let mut inventory = takeout::scan_directory(&content_root)?;
+    let mut inventory = match takeout::scan_directory(&content_root) {
+        Ok(inv) => inv,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err(e.context("Failed to scan extracted content"));
+        }
+    };
 
     let existing_manifest = manifest::read_manifest(&manifest_path);
     let already_imported: HashSet<String> = existing_manifest
@@ -413,8 +419,23 @@ fn cmd_albums(dir: &Path) -> Result<()> {
         ));
         std::fs::create_dir_all(&extract_dir)?;
 
-        let content_root = takeout::extract_zip(zip_path, &extract_dir)?;
-        let inventory = takeout::scan_directory(&content_root)?;
+        let content_root = match takeout::extract_zip(zip_path, &extract_dir) {
+            Ok(root) => root,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                return Err(e.context(format!("Failed to extract {}", zip_path.display())));
+            }
+        };
+        let inventory = match takeout::scan_directory(&content_root) {
+            Ok(inv) => inv,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                return Err(e.context(format!(
+                    "Failed to scan extracted content for {}",
+                    zip_path.display()
+                )));
+            }
+        };
         all_albums.extend(inventory.albums);
 
         std::fs::remove_dir_all(&extract_dir)?;
@@ -765,10 +786,24 @@ fn import_inventory(inventory: &takeout::TakeoutInventory, verbose: bool) -> Imp
 
         match import_result {
             Ok(result) if result.success => {
-                let local_id = result
-                    .local_identifier
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
+                let Some(local_id) = result.local_identifier.clone() else {
+                    let err = "import succeeded but no local identifier returned".to_string();
+                    summary.failed.push(ImportFailure {
+                        path: file.path.display().to_string(),
+                        error: err.clone(),
+                    });
+                    if verbose {
+                        pb.println(format!(
+                            "  ! [{}/{}] {} — {}",
+                            index + 1,
+                            total,
+                            filename,
+                            err
+                        ));
+                    }
+                    pb.inc(1);
+                    continue;
+                };
                 summary.imported.push(ImportedFile {
                     path: file.path.clone(),
                     local_id: local_id.clone(),
@@ -1119,8 +1154,23 @@ fn cmd_retry_missing(dir: &Path, verbose: bool) -> Result<()> {
         }
         std::fs::create_dir_all(&extract_dir)?;
 
-        let content_root = takeout::extract_zip(&zip_path, &extract_dir)?;
-        let inventory = takeout::scan_directory(&content_root)?;
+        let content_root = match takeout::extract_zip(&zip_path, &extract_dir) {
+            Ok(root) => root,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                return Err(e.context(format!("Failed to extract {}", zip_path.display())));
+            }
+        };
+        let inventory = match takeout::scan_directory(&content_root) {
+            Ok(inv) => inv,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&extract_dir);
+                return Err(e.context(format!(
+                    "Failed to scan extracted content for {}",
+                    zip_path.display()
+                )));
+            }
+        };
 
         let mut by_relative: HashMap<String, takeout::MediaFile> = HashMap::new();
         for file in &inventory.files {
