@@ -103,12 +103,12 @@ echo "==> Using command: $BIN_CMD"
 
 echo
 echo "==> Step 1/3: Dry-run parse/import loop"
-eval "$BIN_CMD run --dir \"$WORKDIR\" --once --dry-run"
+eval "$BIN_CMD run \"$WORKDIR\" --once --dry-run"
 
 if [[ "$ENABLE_IMPORT" -eq 1 ]]; then
   echo
   echo "==> Step 2/3: Real import (single ZIP)"
-  eval "$BIN_CMD run --dir \"$WORKDIR\" --once --verbose"
+  eval "$BIN_CMD run \"$WORKDIR\" --once --verbose"
 else
   echo
   echo "==> Step 2/3: Skipped real import (set --enable-import to run)"
@@ -121,7 +121,7 @@ if [[ "$ENABLE_VERIFY" -eq 1 ]]; then
   fi
   echo
   echo "==> Step 3/3: Verify imported assets"
-  eval "$BIN_CMD verify --dir \"$WORKDIR\""
+  eval "$BIN_CMD verify \"$WORKDIR\""
 else
   echo
   echo "==> Step 3/3: Skipped verify (set --enable-verify to run)"
