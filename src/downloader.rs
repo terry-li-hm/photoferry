@@ -148,11 +148,20 @@ fn find_chrome_cookies_db() -> Result<PathBuf> {
 
 fn read_cookies(db_path: &Path, key: &[u8; COOKIES_KEY_LEN]) -> Result<HashMap<String, String>> {
     let conn = Connection::open(db_path).context("Failed to open cookies DB")?;
+
+    // Chrome 130+ (DB meta version ≥ 24) prefixes decrypted values with
+    // SHA256(host_key). We must strip those 32 bytes to get the real value.
+    let db_version: i64 = conn
+        .query_row("SELECT value FROM meta WHERE key='version'", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+
     // Match cookies for google.com and direct subdomains (same as pycookiecheat for takeout.google.com)
     // host_key values: '.google.com', 'takeout.google.com', 'google.com'
     let mut stmt = conn
         .prepare(
-            "SELECT name, encrypted_value FROM cookies \
+            "SELECT name, encrypted_value, host_key FROM cookies \
              WHERE host_key IN ('.google.com', 'google.com', 'takeout.google.com', \
              '.takeout.google.com', 'accounts.google.com', '.accounts.google.com')",
         )
@@ -164,7 +173,8 @@ fn read_cookies(db_path: &Path, key: &[u8; COOKIES_KEY_LEN]) -> Result<HashMap<S
     while let Some(row) = rows.next().context("Error reading cookie row")? {
         let name: String = row.get(0)?;
         let encrypted: Vec<u8> = row.get(1)?;
-        if let Ok(value) = decrypt_cookie_value(&encrypted, key)
+        let host_key: String = row.get(2)?;
+        if let Ok(value) = decrypt_cookie_value(&encrypted, key, db_version, &host_key)
             && !value.is_empty()
         {
             cookies.insert(name, value);
@@ -174,7 +184,12 @@ fn read_cookies(db_path: &Path, key: &[u8; COOKIES_KEY_LEN]) -> Result<HashMap<S
     Ok(cookies)
 }
 
-fn decrypt_cookie_value(encrypted: &[u8], key: &[u8; COOKIES_KEY_LEN]) -> Result<String> {
+fn decrypt_cookie_value(
+    encrypted: &[u8],
+    key: &[u8; COOKIES_KEY_LEN],
+    db_version: i64,
+    host_key: &str,
+) -> Result<String> {
     if encrypted.is_empty() {
         return Ok(String::new());
     }
@@ -195,7 +210,21 @@ fn decrypt_cookie_value(encrypted: &[u8], key: &[u8; COOKIES_KEY_LEN]) -> Result
             .decrypt_padded_mut::<Pkcs7>(&mut buf)
             .map_err(|e| anyhow::anyhow!("AES decrypt error: {e}"))?;
 
-        return Ok(String::from_utf8_lossy(decrypted).into_owned());
+        // Chrome 130+ (DB version ≥ 24): decrypted value is prefixed with
+        // SHA256(host_key) — 32 bytes that must be stripped.
+        let value_bytes = if db_version >= 24 && decrypted.len() > 32 {
+            use sha2::Digest as Sha2Digest;
+            let hash = sha2::Sha256::digest(host_key.as_bytes());
+            if decrypted[..32] == hash[..] {
+                &decrypted[32..]
+            } else {
+                decrypted
+            }
+        } else {
+            decrypted
+        };
+
+        return Ok(String::from_utf8_lossy(value_bytes).into_owned());
     }
 
     // Unencrypted (older Chrome format)
