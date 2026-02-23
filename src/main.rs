@@ -1426,12 +1426,12 @@ fn cmd_download(
 
             let zip_size = zip_path.metadata().map(|m| m.len()).unwrap_or(0);
 
-            // After a successful download (possibly via Chrome), try refreshing
-            // the HTTP client — Chrome may have renewed session cookies
-            if http_client.is_none() {
-                if let Some(new_client) = downloader::try_build_http_client() {
-                    http_client = Some(Arc::new(new_client));
-                }
+            // After every successful download, re-extract cookies — Chrome may
+            // have renewed the session. This maximizes the HTTP-first window
+            // before the next auth challenge, reducing how often the user needs
+            // to be physically present.
+            if let Some(new_client) = downloader::try_build_http_client() {
+                http_client = Some(Arc::new(new_client));
             }
 
             if download_only {
