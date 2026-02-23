@@ -502,27 +502,21 @@ pub fn download_zip(
 // MARK: - Hybrid download
 
 /// Try downloading via HTTP first (fast), fall back to Chrome (reliable/auth) if needed.
+/// Accepts a pre-built client (cookies extracted on main thread to avoid Keychain prompts).
 pub fn download_hybrid(
+    client: Option<&Client>,
     job_id: &str,
     user_id: &str,
     i: usize,
     dir: &Path,
     notifier: Option<&Notifier>,
 ) -> Result<PathBuf> {
-    // 1. Try to get cookies and build client
-    let client = match get_chrome_cookies() {
-        Ok(cookies) => build_client(&cookies).ok(),
-        Err(_) => None,
-    };
-
-    // 2. If we have a client, try download_zip
+    // 1. If we have a client, try HTTP download
     if let Some(client) = client {
-        match download_zip(&client, job_id, user_id, i, dir) {
+        match download_zip(client, job_id, user_id, i, dir) {
             Ok(path) => return Ok(path),
             Err(e) => {
                 let err_msg = e.to_string();
-                // Fall back to Chrome only on auth-related errors
-                // (text/html redirect, 4xx status, or invalid ZIP magic bytes)
                 let is_auth_error = err_msg.contains("text/html")
                     || err_msg.contains("auth issue")
                     || err_msg.contains("auth may have expired");
@@ -534,11 +528,26 @@ pub fn download_hybrid(
             }
         }
     } else {
-        println!("  [{i:02}] Could not load Chrome cookies; using Chrome fallback directly");
+        println!("  [{i:02}] No HTTP client available; using Chrome directly");
     }
 
-    // 3. Fallback to Chrome
+    // 2. Fallback to Chrome
     download_via_chrome(job_id, user_id, i, dir, notifier)
+}
+
+/// Extract Chrome cookies and build an HTTP client.
+/// Call this on the main thread (Keychain access may prompt for user interaction).
+pub fn try_build_http_client() -> Option<Client> {
+    match get_chrome_cookies() {
+        Ok(cookies) => {
+            println!("  Loaded {} Google cookies for HTTP downloads", cookies.len());
+            build_client(&cookies).ok()
+        }
+        Err(e) => {
+            println!("  Cookie extraction failed: {e} — will use Chrome fallback");
+            None
+        }
+    }
 }
 
 // MARK: - Chrome-delegated download

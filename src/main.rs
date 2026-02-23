@@ -1154,6 +1154,9 @@ fn cmd_download(
     let mut total_failed_dl = 0usize;
     let mut total_failed_import = 0usize;
 
+    // Extract cookies on main thread (Keychain may need interactive access)
+    let http_client = downloader::try_build_http_client().map(Arc::new);
+
     if concurrency > 1 {
         // ── Parallel hybrid downloads with sequential import ──────────
 
@@ -1170,6 +1173,7 @@ fn cmd_download(
             let gate = Arc::clone(&gate);
             let tx = tx.clone();
             let notifier = notifier.clone();
+            let http_client = http_client.clone();
             let job_id = job_id.to_string();
             let user_id = user_id.to_string();
             let dir = dir.clone();
@@ -1186,6 +1190,7 @@ fn cmd_download(
                     let start_time = std::time::Instant::now();
 
                     match downloader::download_hybrid(
+                        http_client.as_deref(),
                         &job_id,
                         &user_id,
                         part,
@@ -1370,6 +1375,7 @@ fn cmd_download(
 
             // Download
             let zip_path = match downloader::download_hybrid(
+                http_client.as_deref(),
                 job_id,
                 user_id,
                 i,
