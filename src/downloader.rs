@@ -464,24 +464,41 @@ pub fn download_via_chrome(
         })
         .collect();
 
-    println!("  [{i:02}] Opening download URL in Chrome...");
-    Command::new("open")
-        .args(["-a", "Google Chrome", &url])
-        .spawn()
-        .context("Failed to open URL in Chrome")?;
+    // Guard: check for existing .crdownload files before opening Chrome
+    let pre_existing_crdownloads: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "crdownload"))
+        .collect();
+
+    if !pre_existing_crdownloads.is_empty() {
+        println!(
+            "  [{i:02}] Found {} existing .crdownload file(s) — attaching to existing download",
+            pre_existing_crdownloads.len()
+        );
+    } else {
+        println!("  [{i:02}] Opening download URL in Chrome...");
+        Command::new("open")
+            .args(["-a", "Google Chrome", &url])
+            .spawn()
+            .context("Failed to open URL in Chrome")?;
+    }
 
     println!(
         "  [{i:02}] Waiting for Chrome to download (authenticate if prompted)..."
     );
 
-    // Poll for new zip file or .crdownload file
-    // Chrome uses either "takeout-xxx.zip.crdownload" or "Unconfirmed XXXXXX.crdownload"
     let poll_interval = std::time::Duration::from_secs(5);
     let progress_interval = std::time::Duration::from_secs(30);
+    let stall_timeout = std::time::Duration::from_secs(120); // 2 min stall = retry
     let timeout = std::time::Duration::from_secs(7200); // 2h max per part
+    let max_retries = 3;
     let start = std::time::Instant::now();
-    let mut crdownload_seen = false;
+    let mut crdownload_seen = !pre_existing_crdownloads.is_empty();
     let mut last_progress = std::time::Instant::now() - progress_interval;
+    let mut last_size: u64 = 0;
+    let mut last_size_change = std::time::Instant::now();
+    let mut retries = 0;
 
     loop {
         if start.elapsed() > timeout {
@@ -498,6 +515,46 @@ pub fn download_via_chrome(
         if !crdownloads.is_empty() && !crdownload_seen {
             crdownload_seen = true;
             println!("  [{i:02}] Download started in Chrome");
+        }
+
+        // Stall detection: if download started but size hasn't changed in 2 min, retry
+        if crdownload_seen && !crdownloads.is_empty() {
+            let current_size: u64 = crdownloads
+                .iter()
+                .filter_map(|p| p.metadata().ok())
+                .map(|m| m.len())
+                .sum();
+
+            if current_size != last_size {
+                last_size = current_size;
+                last_size_change = std::time::Instant::now();
+            } else if last_size_change.elapsed() > stall_timeout {
+                retries += 1;
+                if retries > max_retries {
+                    bail!(
+                        "Part {i} stalled {} times — giving up. Delete .crdownload files and retry manually.",
+                        max_retries
+                    );
+                }
+                println!(
+                    "  [{i:02}] Download stalled for {}s — deleting and retrying ({retries}/{max_retries})",
+                    stall_timeout.as_secs()
+                );
+                // Delete stalled .crdownload files
+                for cd in &crdownloads {
+                    let _ = std::fs::remove_file(cd);
+                }
+                // Re-open in Chrome
+                Command::new("open")
+                    .args(["-a", "Google Chrome", &url])
+                    .spawn()
+                    .context("Failed to re-open URL in Chrome")?;
+                crdownload_seen = false;
+                last_size = 0;
+                last_size_change = std::time::Instant::now();
+                std::thread::sleep(poll_interval);
+                continue;
+            }
         }
 
         // Check for new completed zip files
