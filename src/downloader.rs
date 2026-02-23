@@ -8,6 +8,65 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
+
+use crate::notify::{self, Notifier};
+
+// MARK: - Parallel download types
+
+/// Events sent from download worker threads to the main thread.
+pub enum DownloadEvent {
+    Completed {
+        part: usize,
+        zip_path: PathBuf,
+        duration: Duration,
+        size: u64,
+    },
+    Failed {
+        part: usize,
+        error: String,
+    },
+}
+
+/// Gate that blocks until sufficient disk space is available.
+pub struct DiskSpaceGate {
+    dir: PathBuf,
+    min_free_gb: u64,
+}
+
+impl DiskSpaceGate {
+    pub fn new(dir: PathBuf, min_free_gb: u64) -> Self {
+        Self { dir, min_free_gb }
+    }
+
+    /// Block until at least `min_free_gb` GB are free. Polls every 30s.
+    pub fn wait(&self, part: usize) {
+        loop {
+            match available_space_gb(&self.dir) {
+                Some(gb) if gb >= self.min_free_gb => return,
+                Some(gb) => {
+                    println!(
+                        "  [{part:02}] Low disk: {gb}GB free (need {}GB) — waiting 30s",
+                        self.min_free_gb
+                    );
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+                None => return, // Can't check — proceed anyway
+            }
+        }
+    }
+}
+
+/// Returns available disk space in GB for the filesystem containing `path`.
+/// Uses `df -k` — returns None if the command fails or output is unparseable.
+pub fn available_space_gb(path: &Path) -> Option<u64> {
+    let output = Command::new("df").arg("-k").arg(path).output().ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let data_line = stdout.lines().nth(1)?;
+    let fields: Vec<&str> = data_line.split_whitespace().collect();
+    let avail_kb: u64 = fields.get(3)?.parse().ok()?;
+    Some(avail_kb / (1024 * 1024))
+}
 
 const COOKIES_SALT: &[u8] = b"saltysalt";
 const COOKIES_ITERATIONS: u32 = 1003;
@@ -445,11 +504,15 @@ pub fn download_zip(
 /// Download Takeout part `i` by opening the URL in Chrome.
 /// Chrome handles passkey/re-auth challenges natively.
 /// Watches the download directory for the completed zip file.
+///
+/// For parallel safety: snapshots existing `.crdownload` files before opening
+/// Chrome and only tracks NEW ones belonging to this worker.
 pub fn download_via_chrome(
     job_id: &str,
     user_id: &str,
     i: usize,
     dir: &Path,
+    notifier: Option<&Notifier>,
 ) -> Result<PathBuf> {
     let url = build_url(job_id, user_id, i);
 
@@ -464,40 +527,36 @@ pub fn download_via_chrome(
         })
         .collect();
 
-    // Guard: check for existing .crdownload files before opening Chrome
-    let pre_existing_crdownloads: Vec<PathBuf> = std::fs::read_dir(dir)?
+    // Snapshot existing .crdownload files for parallel isolation —
+    // only track NEW ones that appear after we open Chrome
+    let pre_existing_crdownloads: HashSet<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "crdownload"))
         .collect();
 
-    if !pre_existing_crdownloads.is_empty() {
-        println!(
-            "  [{i:02}] Found {} existing .crdownload file(s) — attaching to existing download",
-            pre_existing_crdownloads.len()
-        );
-    } else {
-        println!("  [{i:02}] Opening download URL in Chrome...");
-        Command::new("open")
-            .args(["-a", "Google Chrome", &url])
-            .spawn()
-            .context("Failed to open URL in Chrome")?;
-    }
+    println!("  [{i:02}] Opening download URL in Chrome...");
+    Command::new("open")
+        .args(["-a", "Google Chrome", &url])
+        .spawn()
+        .context("Failed to open URL in Chrome")?;
 
     println!(
         "  [{i:02}] Waiting for Chrome to download (authenticate if prompted)..."
     );
 
-    let poll_interval = std::time::Duration::from_secs(5);
-    let progress_interval = std::time::Duration::from_secs(30);
-    let stall_timeout = std::time::Duration::from_secs(120); // 2 min stall = retry
-    let timeout = std::time::Duration::from_secs(7200); // 2h max per part
+    let poll_interval = Duration::from_secs(5);
+    let progress_interval = Duration::from_secs(30);
+    let auth_alert_timeout = Duration::from_secs(60); // alert if no crdownload after 60s
+    let stall_timeout = Duration::from_secs(120); // 2 min stall = retry
+    let timeout = Duration::from_secs(7200); // 2h max per part
     let max_retries = 3;
-    let start = std::time::Instant::now();
-    let mut crdownload_seen = !pre_existing_crdownloads.is_empty();
-    let mut last_progress = std::time::Instant::now() - progress_interval;
+    let start = Instant::now();
+    let mut crdownload_seen = false;
+    let mut auth_alerted = false;
+    let mut last_progress = Instant::now() - progress_interval;
     let mut last_size: u64 = 0;
-    let mut last_size_change = std::time::Instant::now();
+    let mut last_size_change = Instant::now();
     let mut retries = 0;
 
     loop {
@@ -505,16 +564,27 @@ pub fn download_via_chrome(
             bail!("Timed out waiting for Chrome to download part {i}");
         }
 
-        // Check for ANY .crdownload files (Chrome's partial download indicator)
+        // Check for NEW .crdownload files only (parallel isolation)
         let crdownloads: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.extension().map_or(false, |ext| ext == "crdownload"))
+            .filter(|p| {
+                p.extension().map_or(false, |ext| ext == "crdownload")
+                    && !pre_existing_crdownloads.contains(p)
+            })
             .collect();
 
         if !crdownloads.is_empty() && !crdownload_seen {
             crdownload_seen = true;
             println!("  [{i:02}] Download started in Chrome");
+        }
+
+        // Auth stall alert: no .crdownload appeared within 60s
+        if !crdownload_seen && !auth_alerted && start.elapsed() > auth_alert_timeout {
+            auth_alerted = true;
+            let msg = format!("photoferry: Part {i} may need auth — no download started after 60s. Check Chrome.");
+            println!("  [{i:02}] WARNING: {msg}");
+            notify::notify(notifier, &msg);
         }
 
         // Stall detection: if download started but size hasn't changed in 2 min, retry
@@ -527,7 +597,7 @@ pub fn download_via_chrome(
 
             if current_size != last_size {
                 last_size = current_size;
-                last_size_change = std::time::Instant::now();
+                last_size_change = Instant::now();
             } else if last_size_change.elapsed() > stall_timeout {
                 retries += 1;
                 if retries > max_retries {
@@ -540,7 +610,7 @@ pub fn download_via_chrome(
                     "  [{i:02}] Download stalled for {}s — deleting and retrying ({retries}/{max_retries})",
                     stall_timeout.as_secs()
                 );
-                // Delete stalled .crdownload files
+                // Delete only OUR stalled .crdownload files
                 for cd in &crdownloads {
                     let _ = std::fs::remove_file(cd);
                 }
@@ -551,7 +621,7 @@ pub fn download_via_chrome(
                     .context("Failed to re-open URL in Chrome")?;
                 crdownload_seen = false;
                 last_size = 0;
-                last_size_change = std::time::Instant::now();
+                last_size_change = Instant::now();
                 std::thread::sleep(poll_interval);
                 continue;
             }
@@ -592,7 +662,7 @@ pub fn download_via_chrome(
                 if let Ok(meta) = cd.metadata() {
                     let gb = meta.len() as f64 / 1024.0 / 1024.0 / 1024.0;
                     println!("  [{i:02}] Downloading... {gb:.1}GB so far");
-                    last_progress = std::time::Instant::now();
+                    last_progress = Instant::now();
                 }
             }
         }

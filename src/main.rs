@@ -3,6 +3,7 @@ mod downloader;
 mod importer;
 mod manifest;
 mod metadata;
+mod notify;
 mod sidecar;
 mod takeout;
 
@@ -13,7 +14,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 const STRICT_EXTENSIONS_ABORT: &str = "STRICT_EXTENSIONS_ABORT";
@@ -115,6 +115,9 @@ enum Commands {
         /// Last part index inclusive (default: 98 for 99 parts)
         #[arg(long, default_value_t = 98)]
         end: usize,
+        /// Number of parallel Chrome downloads (default: 2)
+        #[arg(long, default_value_t = 2)]
+        concurrency: usize,
         /// Download only, skip import
         #[arg(long)]
         download_only: bool,
@@ -183,6 +186,7 @@ fn main() -> Result<()> {
             dir,
             start,
             end,
+            concurrency,
             download_only,
             chrome,
             verbose,
@@ -196,6 +200,7 @@ fn main() -> Result<()> {
             &dir,
             start,
             end,
+            concurrency,
             download_only,
             chrome,
             verbose,
@@ -1087,6 +1092,7 @@ fn cmd_download(
     dir: &Path,
     start: usize,
     end: usize,
+    concurrency: usize,
     download_only: bool,
     use_chrome: bool,
     verbose: bool,
@@ -1095,11 +1101,18 @@ fn cmd_download(
     unknown_report: Option<&Path>,
     icloud_confirmed: bool,
 ) -> Result<()> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex, mpsc};
+
     let dir = expand_tilde(dir);
     std::fs::create_dir_all(&dir)?;
+    let concurrency = concurrency.max(1);
+
+    // Telegram notifications (silent no-op if env vars unset)
+    let notifier = notify::Notifier::from_env().map(Arc::new);
 
     display::print_header(&format!(
-        "Downloading Takeout parts {start}–{end} → {}",
+        "Downloading Takeout parts {start}–{end} → {} (concurrency: {concurrency})",
         dir.display()
     ));
     if !download_only && !icloud_confirmed {
@@ -1120,175 +1133,447 @@ fn cmd_download(
     progress.user_id = user_id.to_string();
     progress.save(&dir)?;
 
+    // Build work queue: skip already-completed parts
+    let mut work: VecDeque<usize> = VecDeque::new();
+    for i in start..=end {
+        if progress.is_completed(i) {
+            display::print_info(&format!("  [{i:02}] Already done, skipping"));
+        } else {
+            work.push_back(i);
+        }
+    }
+
+    let total_remaining = work.len();
+    if total_remaining == 0 {
+        display::print_success("All parts already completed");
+        return Ok(());
+    }
+
+    // Pipeline stats for ETA
+    let stats = Arc::new(notify::PipelineStats::new(total_remaining));
+
+    notify::notify(
+        notifier.as_deref(),
+        &format!(
+            "photoferry: Starting parts {start}–{end} ({total_remaining} remaining, concurrency {concurrency})"
+        ),
+    );
+
     let mut total_imported = 0usize;
     let mut total_failed_dl = 0usize;
     let mut total_failed_import = 0usize;
 
-    // Build HTTP client (only needed for non-Chrome mode)
-    let mut client: Option<Client> = if !use_chrome {
-        fn fresh_client() -> Result<Client> {
-            let cookies = downloader::get_chrome_cookies().context(
-                "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
-            )?;
-            display::print_info(&format!("Loaded {} Google cookies", cookies.len()));
-            downloader::build_client(&cookies)
-        }
-        Some(fresh_client()?)
-    } else {
-        display::print_info("Using Chrome browser for downloads (passkey/re-auth handled natively)");
-        None
-    };
+    if use_chrome && concurrency > 1 {
+        // ── Parallel Chrome downloads with sequential import ──────────
 
-    for i in start..=end {
-        if progress.is_completed(i) {
-            display::print_info(&format!("  [{i:02}] Already done, skipping"));
-            continue;
-        }
+        let work_queue = Arc::new(Mutex::new(work));
+        let gate = Arc::new(downloader::DiskSpaceGate::new(dir.clone(), 20));
+        let (tx, rx) = mpsc::channel::<downloader::DownloadEvent>();
 
-        println!();
-        display::print_header(&format!("Part {i}/{end}"));
+        // Spawn N download worker threads
+        let mut handles = Vec::new();
+        for _ in 0..concurrency {
+            let queue = Arc::clone(&work_queue);
+            let gate = Arc::clone(&gate);
+            let tx = tx.clone();
+            let notifier = notifier.clone();
+            let job_id = job_id.to_string();
+            let user_id = user_id.to_string();
+            let dir = dir.clone();
 
-        // Disk space guard — wait until ≥20GB free before downloading
-        const MIN_FREE_GB: u64 = 20;
-        loop {
-            match available_space_gb(&dir) {
-                Some(gb) if gb >= MIN_FREE_GB => break,
-                Some(gb) => {
-                    display::print_warning(&format!(
-                        "  [{i:02}] Low disk: {gb}GB free (need {MIN_FREE_GB}GB) — waiting 60s for iCloud to upload"
-                    ));
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                }
-                None => break, // Can't check — proceed anyway
-            }
-        }
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    let part = {
+                        let mut q = queue.lock().unwrap();
+                        q.pop_front()
+                    };
+                    let Some(part) = part else { break };
 
-        // Download — Chrome mode or direct HTTP
-        let zip_path = if use_chrome {
-            match downloader::download_via_chrome(job_id, user_id, i, &dir) {
-                Ok(p) => p,
-                Err(e) => {
-                    display::print_error(&format!("  [{i:02}] Chrome download failed: {e} — skipping"));
-                    progress.mark_failed(i, &dir);
-                    total_failed_dl += 1;
-                    continue;
-                }
-            }
-        } else {
-            // Direct HTTP download with cookie refresh per-part
-            fn fresh_client() -> Result<Client> {
-                let cookies = downloader::get_chrome_cookies().context(
-                    "Failed to get Chrome cookies",
-                )?;
-                downloader::build_client(&cookies)
-            }
-            if let Ok(c) = fresh_client() {
-                client = Some(c);
-            }
-            let c = client.as_ref().unwrap();
-            match downloader::download_zip(c, job_id, user_id, i, &dir) {
-                Ok(p) => p,
-                Err(e) => {
-                    display::print_error(&format!("  [{i:02}] Download failed: {e}"));
-                    display::print_info(&format!("  [{i:02}] Refreshing cookies and retrying in 10s..."));
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    if let Ok(c) = fresh_client() {
-                        client = Some(c);
-                    }
-                    match downloader::download_zip(client.as_ref().unwrap(), job_id, user_id, i, &dir) {
-                        Ok(p) => p,
-                        Err(e2) => {
-                            display::print_error(&format!("  [{i:02}] Retry failed: {e2} — skipping"));
-                            progress.mark_failed(i, &dir);
-                            total_failed_dl += 1;
-                            continue;
+                    gate.wait(part);
+                    let start_time = std::time::Instant::now();
+
+                    match downloader::download_via_chrome(
+                        &job_id,
+                        &user_id,
+                        part,
+                        &dir,
+                        notifier.as_deref(),
+                    ) {
+                        Ok(zip_path) => {
+                            let size = zip_path.metadata().map(|m| m.len()).unwrap_or(0);
+                            let _ = tx.send(downloader::DownloadEvent::Completed {
+                                part,
+                                zip_path,
+                                duration: start_time.elapsed(),
+                                size,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(downloader::DownloadEvent::Failed {
+                                part,
+                                error: e.to_string(),
+                            });
                         }
                     }
                 }
-            }
-        };
-
-        if download_only {
-            display::print_success(&format!("  [{i:02}] Downloaded → {}", zip_path.display()));
-            progress.mark_completed(i, &dir);
-            total_imported += 1;
-            continue;
+            }));
         }
+        // Drop sender so rx iterator ends when all workers finish
+        drop(tx);
 
-        // Import
-        display::print_info(&format!(
-            "  [{i:02}] Importing {}...",
-            zip_path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        match process_one_zip(
-            &zip_path,
-            &dir,
-            false,
-            verbose,
-            include_trashed,
-            false,
-            strict_extensions,
-            unknown_report,
-        ) {
-            Ok(summary) => {
-                print_import_summary(&summary);
-                total_imported += summary.imported.len();
-                let had_failures = !summary.failed.is_empty();
-                if had_failures {
-                    total_failed_import += summary.failed.len();
-                    display::print_warning(&format!(
-                        "  [{i:02}] {} files failed — zip kept for retry",
-                        summary.failed.len()
+        // Main thread: receive events, import sequentially (PhotoKit not thread-safe)
+        for event in rx {
+            match event {
+                downloader::DownloadEvent::Completed {
+                    part,
+                    zip_path,
+                    duration,
+                    size,
+                } => {
+                    let size_gb = size as f64 / 1024.0 / 1024.0 / 1024.0;
+
+                    if download_only {
+                        display::print_success(&format!(
+                            "  [{part:02}] Downloaded → {} ({size_gb:.1}GB)",
+                            zip_path.display()
+                        ));
+                        progress.mark_completed(part, &dir);
+                        total_imported += 1;
+                        stats.record_part(size, duration);
+                        let eta = stats.eta_string();
+                        display::print_info(&format!("  {eta}"));
+                        notify::notify(
+                            notifier.as_deref(),
+                            &format!("photoferry: Part {part} downloaded ({size_gb:.1}GB). {eta}"),
+                        );
+                        continue;
+                    }
+
+                    // Import on main thread
+                    display::print_info(&format!(
+                        "  [{part:02}] Importing {}...",
+                        zip_path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    // Don't mark completed — allow retry on next run
-                } else {
-                    // Verify all assets exist in Photos Library before deleting zip
-                    if verify_zip_manifest(&zip_path, &dir) {
-                        progress.mark_completed(i, &dir);
-                        match verify_success_action(icloud_confirmed) {
-                            VerifySuccessAction::KeepZipAndMarkCompleted => {
+                    match process_one_zip(
+                        &zip_path,
+                        &dir,
+                        false,
+                        verbose,
+                        include_trashed,
+                        false,
+                        strict_extensions,
+                        unknown_report,
+                    ) {
+                        Ok(summary) => {
+                            let imported_count = summary.imported.len();
+                            print_import_summary(&summary);
+                            total_imported += imported_count;
+                            let had_failures = !summary.failed.is_empty();
+                            if had_failures {
+                                total_failed_import += summary.failed.len();
                                 display::print_warning(&format!(
-                                    "  [{i:02}] Verify passed, but iCloud sync not confirmed (--icloud-confirmed not set) — keeping zip (part marked completed)"
+                                    "  [{part:02}] {} files failed — zip kept for retry",
+                                    summary.failed.len()
                                 ));
-                                continue;
-                            }
-                            VerifySuccessAction::DeleteZipAndMarkCompleted => {
-                                if let Err(e) = std::fs::remove_file(&zip_path) {
-                                    display::print_warning(&format!(
-                                        "  [{i:02}] Verified OK but could not delete zip: {e}"
-                                    ));
+                                notify::notify(
+                                    notifier.as_deref(),
+                                    &format!(
+                                        "photoferry: Part {part} imported with {} failures — zip kept",
+                                        summary.failed.len()
+                                    ),
+                                );
+                            } else {
+                                if verify_zip_manifest(&zip_path, &dir) {
+                                    progress.mark_completed(part, &dir);
+                                    match verify_success_action(icloud_confirmed) {
+                                        VerifySuccessAction::KeepZipAndMarkCompleted => {
+                                            display::print_warning(&format!(
+                                                "  [{part:02}] Verify passed — keeping zip (iCloud sync not confirmed)"
+                                            ));
+                                        }
+                                        VerifySuccessAction::DeleteZipAndMarkCompleted => {
+                                            if let Err(e) = std::fs::remove_file(&zip_path) {
+                                                display::print_warning(&format!(
+                                                    "  [{part:02}] Verified OK but could not delete zip: {e}"
+                                                ));
+                                            } else {
+                                                display::print_success(&format!(
+                                                    "  [{part:02}] Verified + deleted {}",
+                                                    zip_path.file_name().unwrap_or_default().to_string_lossy()
+                                                ));
+                                            }
+                                        }
+                                    }
                                 } else {
-                                    display::print_success(&format!(
-                                        "  [{i:02}] Verified + deleted {}",
-                                        zip_path.file_name().unwrap_or_default().to_string_lossy()
+                                    display::print_warning(&format!(
+                                        "  [{part:02}] Import OK but verify failed — keeping zip"
                                     ));
                                 }
+                                notify::notify(
+                                    notifier.as_deref(),
+                                    &format!(
+                                        "photoferry: Part {part} imported — {imported_count} files"
+                                    ),
+                                );
                             }
+                            stats.record_part(size, duration);
+                            let eta = stats.eta_string();
+                            display::print_info(&format!("  {eta}"));
                         }
-                    } else {
-                        display::print_warning(&format!(
-                            "  [{i:02}] Import OK but verify failed — keeping zip"
-                        ));
-                        // Don't mark completed — verify on next run
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if msg.starts_with(STRICT_EXTENSIONS_ABORT) {
+                                let cleaned = msg
+                                    .strip_prefix(STRICT_EXTENSIONS_ABORT)
+                                    .unwrap_or(&msg)
+                                    .trim_start_matches(':')
+                                    .trim();
+                                // Can't abort workers mid-flight — log and continue
+                                display::print_error(&format!(
+                                    "  [{part:02}] Strict extensions abort: {cleaned}"
+                                ));
+                            }
+                            display::print_error(&format!(
+                                "  [{part:02}] Import failed: {e} — zip kept"
+                            ));
+                            progress.mark_failed(part, &dir);
+                            total_failed_import += 1;
+                            notify::notify(
+                                notifier.as_deref(),
+                                &format!("photoferry: FAILED part {part} import — {e}"),
+                            );
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.starts_with(STRICT_EXTENSIONS_ABORT) {
-                    let cleaned = msg
-                        .strip_prefix(STRICT_EXTENSIONS_ABORT)
-                        .unwrap_or(&msg)
-                        .trim_start_matches(':')
-                        .trim();
-                    return Err(anyhow::anyhow!(cleaned.to_string()));
+                downloader::DownloadEvent::Failed { part, error } => {
+                    display::print_error(&format!(
+                        "  [{part:02}] Chrome download failed: {error} — skipping"
+                    ));
+                    progress.mark_failed(part, &dir);
+                    total_failed_dl += 1;
+                    notify::notify(
+                        notifier.as_deref(),
+                        &format!("photoferry: FAILED part {part} download — {error}"),
+                    );
                 }
-                display::print_error(&format!("  [{i:02}] Import failed: {e} — zip kept"));
-                progress.mark_failed(i, &dir);
-                total_failed_import += 1;
+            }
+        }
+
+        // Wait for all worker threads to finish
+        for h in handles {
+            let _ = h.join();
+        }
+    } else {
+        // ── Serial mode (concurrency=1 or non-Chrome HTTP) ───────────
+
+        let mut client: Option<Client> = if !use_chrome {
+            fn fresh_client() -> Result<Client> {
+                let cookies = downloader::get_chrome_cookies().context(
+                    "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
+                )?;
+                display::print_info(&format!("Loaded {} Google cookies", cookies.len()));
+                downloader::build_client(&cookies)
+            }
+            Some(fresh_client()?)
+        } else {
+            display::print_info(
+                "Using Chrome browser for downloads (passkey/re-auth handled natively)",
+            );
+            None
+        };
+
+        let gate = downloader::DiskSpaceGate::new(dir.clone(), 20);
+
+        for i in work {
+            println!();
+            display::print_header(&format!("Part {i}/{end}"));
+
+            gate.wait(i);
+            let part_start = std::time::Instant::now();
+
+            // Download
+            let zip_path = if use_chrome {
+                match downloader::download_via_chrome(
+                    job_id,
+                    user_id,
+                    i,
+                    &dir,
+                    notifier.as_deref(),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        display::print_error(&format!(
+                            "  [{i:02}] Chrome download failed: {e} — skipping"
+                        ));
+                        progress.mark_failed(i, &dir);
+                        total_failed_dl += 1;
+                        notify::notify(
+                            notifier.as_deref(),
+                            &format!("photoferry: FAILED part {i} download — {e}"),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                fn fresh_client() -> Result<Client> {
+                    let cookies = downloader::get_chrome_cookies()
+                        .context("Failed to get Chrome cookies")?;
+                    downloader::build_client(&cookies)
+                }
+                if let Ok(c) = fresh_client() {
+                    client = Some(c);
+                }
+                let c = client.as_ref().unwrap();
+                match downloader::download_zip(c, job_id, user_id, i, &dir) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        display::print_error(&format!("  [{i:02}] Download failed: {e}"));
+                        display::print_info(&format!(
+                            "  [{i:02}] Refreshing cookies and retrying in 10s..."
+                        ));
+                        std::thread::sleep(std::time::Duration::from_secs(10));
+                        if let Ok(c) = fresh_client() {
+                            client = Some(c);
+                        }
+                        match downloader::download_zip(
+                            client.as_ref().unwrap(),
+                            job_id,
+                            user_id,
+                            i,
+                            &dir,
+                        ) {
+                            Ok(p) => p,
+                            Err(e2) => {
+                                display::print_error(&format!(
+                                    "  [{i:02}] Retry failed: {e2} — skipping"
+                                ));
+                                progress.mark_failed(i, &dir);
+                                total_failed_dl += 1;
+                                notify::notify(
+                                    notifier.as_deref(),
+                                    &format!("photoferry: FAILED part {i} download — {e2}"),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+            };
+
+            let zip_size = zip_path.metadata().map(|m| m.len()).unwrap_or(0);
+
+            if download_only {
+                display::print_success(&format!(
+                    "  [{i:02}] Downloaded → {}",
+                    zip_path.display()
+                ));
+                progress.mark_completed(i, &dir);
+                total_imported += 1;
+                stats.record_part(zip_size, part_start.elapsed());
+                let eta = stats.eta_string();
+                display::print_info(&format!("  {eta}"));
+                notify::notify(
+                    notifier.as_deref(),
+                    &format!(
+                        "photoferry: Part {i} downloaded ({:.1}GB). {eta}",
+                        zip_size as f64 / 1024.0 / 1024.0 / 1024.0
+                    ),
+                );
+                continue;
+            }
+
+            // Import
+            display::print_info(&format!(
+                "  [{i:02}] Importing {}...",
+                zip_path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            match process_one_zip(
+                &zip_path,
+                &dir,
+                false,
+                verbose,
+                include_trashed,
+                false,
+                strict_extensions,
+                unknown_report,
+            ) {
+                Ok(summary) => {
+                    let imported_count = summary.imported.len();
+                    print_import_summary(&summary);
+                    total_imported += imported_count;
+                    let had_failures = !summary.failed.is_empty();
+                    if had_failures {
+                        total_failed_import += summary.failed.len();
+                        display::print_warning(&format!(
+                            "  [{i:02}] {} files failed — zip kept for retry",
+                            summary.failed.len()
+                        ));
+                    } else {
+                        if verify_zip_manifest(&zip_path, &dir) {
+                            progress.mark_completed(i, &dir);
+                            match verify_success_action(icloud_confirmed) {
+                                VerifySuccessAction::KeepZipAndMarkCompleted => {
+                                    display::print_warning(&format!(
+                                        "  [{i:02}] Verify passed — keeping zip (iCloud sync not confirmed)"
+                                    ));
+                                }
+                                VerifySuccessAction::DeleteZipAndMarkCompleted => {
+                                    if let Err(e) = std::fs::remove_file(&zip_path) {
+                                        display::print_warning(&format!(
+                                            "  [{i:02}] Verified OK but could not delete zip: {e}"
+                                        ));
+                                    } else {
+                                        display::print_success(&format!(
+                                            "  [{i:02}] Verified + deleted {}",
+                                            zip_path
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            display::print_warning(&format!(
+                                "  [{i:02}] Import OK but verify failed — keeping zip"
+                            ));
+                        }
+                    }
+                    stats.record_part(zip_size, part_start.elapsed());
+                    let eta = stats.eta_string();
+                    display::print_info(&format!("  {eta}"));
+                    notify::notify(
+                        notifier.as_deref(),
+                        &format!(
+                            "photoferry: Part {i} imported — {imported_count} files. {eta}"
+                        ),
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.starts_with(STRICT_EXTENSIONS_ABORT) {
+                        let cleaned = msg
+                            .strip_prefix(STRICT_EXTENSIONS_ABORT)
+                            .unwrap_or(&msg)
+                            .trim_start_matches(':')
+                            .trim();
+                        return Err(anyhow::anyhow!(cleaned.to_string()));
+                    }
+                    display::print_error(&format!(
+                        "  [{i:02}] Import failed: {e} — zip kept"
+                    ));
+                    progress.mark_failed(i, &dir);
+                    total_failed_import += 1;
+                    notify::notify(
+                        notifier.as_deref(),
+                        &format!("photoferry: FAILED part {i} import — {e}"),
+                    );
+                }
             }
         }
     }
+
+    // ── Summary ──────────────────────────────────────────────────────
 
     println!();
     display::print_header("Download run complete");
@@ -1304,9 +1589,20 @@ fn cmd_download(
     if total_failed_import > 0 {
         display::print_warning(&format!("Import failures: {total_failed_import}"));
     }
-    if total_failed_dl == 0 && total_failed_import == 0 {
+    let all_ok = total_failed_dl == 0 && total_failed_import == 0;
+    if all_ok {
         display::print_success("All parts completed successfully");
     }
+
+    // Final summary notification
+    let summary_msg = format!(
+        "photoferry: Run complete — {} parts done, {} DL failures, {} import failures. {}",
+        progress.completed.len(),
+        total_failed_dl,
+        total_failed_import,
+        stats.eta_string()
+    );
+    notify::notify(notifier.as_deref(), &summary_msg);
 
     Ok(())
 }
@@ -2357,17 +2653,6 @@ fn date_mismatch(expected: Option<&str>, actual: Option<&str>) -> bool {
     }
 }
 
-/// Returns available disk space in GB for the filesystem containing `path`.
-/// Uses `df -k` — returns None if the command fails or output is unparseable.
-fn available_space_gb(path: &Path) -> Option<u64> {
-    let output = Command::new("df").arg("-k").arg(path).output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Second line is the data row: Filesystem 1K-blocks Used Available Capacity ...
-    let data_line = stdout.lines().nth(1)?;
-    let fields: Vec<&str> = data_line.split_whitespace().collect();
-    let avail_kb: u64 = fields.get(3)?.parse().ok()?;
-    Some(avail_kb / (1024 * 1024)) // KB → GB
-}
 
 /// Batch-verify all assets recorded in a zip's manifest exist in Photos Library.
 /// Returns true if all present (safe to delete zip), false if any missing.
