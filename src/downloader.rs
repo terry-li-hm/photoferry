@@ -80,6 +80,9 @@ pub struct DownloadProgress {
     pub user_id: String,
     pub completed: Vec<usize>,
     pub failed: Vec<usize>,
+    /// Download attempts per part (Google allows max 5 per export).
+    #[serde(default)]
+    pub attempts: HashMap<usize, usize>,
 }
 
 impl DownloadProgress {
@@ -97,6 +100,7 @@ impl DownloadProgress {
                 user_id: String::new(),
                 completed: Vec::new(),
                 failed: Vec::new(),
+                attempts: HashMap::new(),
             }),
             Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
         }
@@ -125,6 +129,20 @@ impl DownloadProgress {
 
     pub fn is_completed(&self, i: usize) -> bool {
         self.completed.contains(&i)
+    }
+
+    /// Record a download attempt for part `i`. Returns the new attempt count.
+    pub fn record_attempt(&mut self, i: usize, dir: &Path) -> usize {
+        let count = self.attempts.entry(i).or_insert(0);
+        *count += 1;
+        let result = *count;
+        let _ = self.save(dir);
+        result
+    }
+
+    /// How many of Google's 5 download attempts remain for part `i`.
+    pub fn attempts_remaining(&self, i: usize) -> usize {
+        5usize.saturating_sub(*self.attempts.get(&i).unwrap_or(&0))
     }
 }
 
@@ -578,23 +596,45 @@ pub fn download_via_chrome(
         })
         .collect();
 
-    // Snapshot existing .crdownload files for parallel isolation —
-    // only track NEW ones that appear after we open Chrome
-    let pre_existing_crdownloads: HashSet<PathBuf> = std::fs::read_dir(dir)?
+    // Check for existing .crdownload files that might be from a previous run
+    // (Chrome download still in progress from a killed photoferry instance)
+    let existing_crdownloads: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "crdownload"))
         .collect();
 
-    println!("  [{i:02}] Opening download URL in Chrome...");
-    Command::new("open")
-        .args(["-a", "Google Chrome", &url])
-        .spawn()
-        .context("Failed to open URL in Chrome")?;
+    // If there's already a .crdownload, attach to it instead of opening Chrome again
+    let attached = if !existing_crdownloads.is_empty() {
+        println!(
+            "  [{i:02}] Found {} existing .crdownload — attaching to in-progress download",
+            existing_crdownloads.len()
+        );
+        true
+    } else {
+        println!("  [{i:02}] Opening download URL in Chrome...");
+        Command::new("open")
+            .args(["-a", "Google Chrome", &url])
+            .spawn()
+            .context("Failed to open URL in Chrome")?;
+        false
+    };
 
-    println!(
-        "  [{i:02}] Waiting for Chrome to download (authenticate if prompted)..."
-    );
+    // For parallel isolation: snapshot crdownloads AFTER opening Chrome
+    // so we only track files from THIS worker
+    let pre_existing_crdownloads: HashSet<PathBuf> = if attached {
+        // When attaching, treat NO files as pre-existing so we monitor all of them
+        HashSet::new()
+    } else {
+        // When opening fresh, snapshot existing ones to exclude other workers' files
+        existing_crdownloads.into_iter().collect()
+    };
+
+    if !attached {
+        println!(
+            "  [{i:02}] Waiting for Chrome to download (authenticate if prompted)..."
+        );
+    }
 
     let poll_interval = Duration::from_secs(5);
     let progress_interval = Duration::from_secs(30);

@@ -1124,11 +1124,15 @@ fn cmd_download(
     progress.user_id = user_id.to_string();
     progress.save(&dir)?;
 
-    // Build work queue: skip already-completed parts
+    // Build work queue: skip already-completed and exhausted parts
     let mut work: VecDeque<usize> = VecDeque::new();
     for i in start..=end {
         if progress.is_completed(i) {
             display::print_info(&format!("  [{i:02}] Already done, skipping"));
+        } else if progress.attempts_remaining(i) == 0 {
+            display::print_warning(&format!(
+                "  [{i:02}] Exhausted (5 download attempts) — skipping. Re-export to reset."
+            ));
         } else {
             work.push_back(i);
         }
@@ -1155,7 +1159,9 @@ fn cmd_download(
     let mut total_failed_import = 0usize;
 
     // Extract cookies on main thread (Keychain may need interactive access)
-    let http_client = downloader::try_build_http_client().map(Arc::new);
+    let mut http_client = downloader::try_build_http_client().map(Arc::new);
+
+    let progress = Arc::new(Mutex::new(progress));
 
     if concurrency > 1 {
         // ── Parallel hybrid downloads with sequential import ──────────
@@ -1174,6 +1180,7 @@ fn cmd_download(
             let tx = tx.clone();
             let notifier = notifier.clone();
             let http_client = http_client.clone();
+            let progress = Arc::clone(&progress);
             let job_id = job_id.to_string();
             let user_id = user_id.to_string();
             let dir = dir.clone();
@@ -1185,6 +1192,16 @@ fn cmd_download(
                         q.pop_front()
                     };
                     let Some(part) = part else { break };
+
+                    // Record attempt before starting download
+                    {
+                        let mut p = progress.lock().unwrap();
+                        let attempt = p.record_attempt(part, &dir);
+                        let remaining = 5usize.saturating_sub(attempt);
+                        if remaining > 0 {
+                            println!("  [{part:02}] Download attempt {attempt}/5 ({remaining} remaining)");
+                        }
+                    }
 
                     gate.wait(part);
                     let start_time = std::time::Instant::now();
@@ -1235,7 +1252,7 @@ fn cmd_download(
                             "  [{part:02}] Downloaded → {} ({size_gb:.1}GB)",
                             zip_path.display()
                         ));
-                        progress.mark_completed(part, &dir);
+                        progress.lock().unwrap().mark_completed(part, &dir);
                         total_imported += 1;
                         stats.record_part(size, duration);
                         let eta = stats.eta_string();
@@ -1282,7 +1299,7 @@ fn cmd_download(
                                 );
                             } else {
                                 if verify_zip_manifest(&zip_path, &dir) {
-                                    progress.mark_completed(part, &dir);
+                                    progress.lock().unwrap().mark_completed(part, &dir);
                                     match verify_success_action(keep_zips) {
                                         VerifySuccessAction::KeepZipAndMarkCompleted => {
                                             display::print_warning(&format!(
@@ -1334,7 +1351,7 @@ fn cmd_download(
                             display::print_error(&format!(
                                 "  [{part:02}] Import failed: {e} — zip kept"
                             ));
-                            progress.mark_failed(part, &dir);
+                            progress.lock().unwrap().mark_failed(part, &dir);
                             total_failed_import += 1;
                             notify::notify(
                                 notifier.as_deref(),
@@ -1347,7 +1364,7 @@ fn cmd_download(
                     display::print_error(&format!(
                         "  [{part:02}] Download failed: {error} — skipping"
                     ));
-                    progress.mark_failed(part, &dir);
+                    progress.lock().unwrap().mark_failed(part, &dir);
                     total_failed_dl += 1;
                     notify::notify(
                         notifier.as_deref(),
@@ -1373,6 +1390,16 @@ fn cmd_download(
             gate.wait(i);
             let part_start = std::time::Instant::now();
 
+            // Record attempt before download
+            {
+                let mut p = progress.lock().unwrap();
+                let attempt = p.record_attempt(i, &dir);
+                let remaining = 5usize.saturating_sub(attempt);
+                if remaining > 0 {
+                    println!("  [{i:02}] Download attempt {attempt}/5 ({remaining} remaining)");
+                }
+            }
+
             // Download
             let zip_path = match downloader::download_hybrid(
                 http_client.as_deref(),
@@ -1387,7 +1414,7 @@ fn cmd_download(
                     display::print_error(&format!(
                         "  [{i:02}] Download failed: {e} — skipping"
                     ));
-                    progress.mark_failed(i, &dir);
+                    progress.lock().unwrap().mark_failed(i, &dir);
                     total_failed_dl += 1;
                     notify::notify(
                         notifier.as_deref(),
@@ -1399,12 +1426,20 @@ fn cmd_download(
 
             let zip_size = zip_path.metadata().map(|m| m.len()).unwrap_or(0);
 
+            // After a successful download (possibly via Chrome), try refreshing
+            // the HTTP client — Chrome may have renewed session cookies
+            if http_client.is_none() {
+                if let Some(new_client) = downloader::try_build_http_client() {
+                    http_client = Some(Arc::new(new_client));
+                }
+            }
+
             if download_only {
                 display::print_success(&format!(
                     "  [{i:02}] Downloaded → {}",
                     zip_path.display()
                 ));
-                progress.mark_completed(i, &dir);
+                progress.lock().unwrap().mark_completed(i, &dir);
                 total_imported += 1;
                 stats.record_part(zip_size, part_start.elapsed());
                 let eta = stats.eta_string();
@@ -1447,7 +1482,7 @@ fn cmd_download(
                         ));
                     } else {
                         if verify_zip_manifest(&zip_path, &dir) {
-                            progress.mark_completed(i, &dir);
+                            progress.lock().unwrap().mark_completed(i, &dir);
                             match verify_success_action(keep_zips) {
                                 VerifySuccessAction::KeepZipAndMarkCompleted => {
                                     display::print_warning(&format!(
@@ -1499,7 +1534,7 @@ fn cmd_download(
                     display::print_error(&format!(
                         "  [{i:02}] Import failed: {e} — zip kept"
                     ));
-                    progress.mark_failed(i, &dir);
+                    progress.lock().unwrap().mark_failed(i, &dir);
                     total_failed_import += 1;
                     notify::notify(
                         notifier.as_deref(),
@@ -1514,6 +1549,7 @@ fn cmd_download(
 
     println!();
     display::print_header("Download run complete");
+    let progress = progress.lock().unwrap();
     display::print_info(&format!("Parts completed: {}", progress.completed.len()));
     if download_only {
         display::print_info(&format!("Downloaded: {total_imported}"));
