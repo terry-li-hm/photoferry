@@ -7,6 +7,7 @@ mod sidecar;
 mod takeout;
 
 use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +118,9 @@ enum Commands {
         /// Download only, skip import
         #[arg(long)]
         download_only: bool,
+        /// Use Chrome browser for downloading (handles passkey/re-auth)
+        #[arg(long)]
+        chrome: bool,
         /// Print per-file import results
         #[arg(long)]
         verbose: bool,
@@ -180,6 +184,7 @@ fn main() -> Result<()> {
             start,
             end,
             download_only,
+            chrome,
             verbose,
             include_trashed,
             strict_extensions,
@@ -192,6 +197,7 @@ fn main() -> Result<()> {
             start,
             end,
             download_only,
+            chrome,
             verbose,
             include_trashed,
             strict_extensions,
@@ -1082,6 +1088,7 @@ fn cmd_download(
     start: usize,
     end: usize,
     download_only: bool,
+    use_chrome: bool,
     verbose: bool,
     include_trashed: bool,
     strict_extensions: bool,
@@ -1113,17 +1120,24 @@ fn cmd_download(
     progress.user_id = user_id.to_string();
     progress.save(&dir)?;
 
-    display::print_info("Extracting Chrome cookies...");
-    let cookies = downloader::get_chrome_cookies().context(
-        "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
-    )?;
-    display::print_success(&format!("Got {} Google cookies", cookies.len()));
-
-    let client = downloader::build_client(&cookies)?;
-
     let mut total_imported = 0usize;
     let mut total_failed_dl = 0usize;
     let mut total_failed_import = 0usize;
+
+    // Build HTTP client (only needed for non-Chrome mode)
+    let mut client: Option<Client> = if !use_chrome {
+        fn fresh_client() -> Result<Client> {
+            let cookies = downloader::get_chrome_cookies().context(
+                "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
+            )?;
+            display::print_info(&format!("Loaded {} Google cookies", cookies.len()));
+            downloader::build_client(&cookies)
+        }
+        Some(fresh_client()?)
+    } else {
+        display::print_info("Using Chrome browser for downloads (passkey/re-auth handled natively)");
+        None
+    };
 
     for i in start..=end {
         if progress.is_completed(i) {
@@ -1149,20 +1163,46 @@ fn cmd_download(
             }
         }
 
-        // Download
-        let zip_path = match downloader::download_zip(&client, job_id, user_id, i, &dir) {
-            Ok(p) => p,
-            Err(e) => {
-                display::print_error(&format!("  [{i:02}] Download failed: {e}"));
-                // Retry once after 10s
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                match downloader::download_zip(&client, job_id, user_id, i, &dir) {
-                    Ok(p) => p,
-                    Err(e2) => {
-                        display::print_error(&format!("  [{i:02}] Retry failed: {e2} — skipping"));
-                        progress.mark_failed(i, &dir);
-                        total_failed_dl += 1;
-                        continue;
+        // Download — Chrome mode or direct HTTP
+        let zip_path = if use_chrome {
+            match downloader::download_via_chrome(job_id, user_id, i, &dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    display::print_error(&format!("  [{i:02}] Chrome download failed: {e} — skipping"));
+                    progress.mark_failed(i, &dir);
+                    total_failed_dl += 1;
+                    continue;
+                }
+            }
+        } else {
+            // Direct HTTP download with cookie refresh per-part
+            fn fresh_client() -> Result<Client> {
+                let cookies = downloader::get_chrome_cookies().context(
+                    "Failed to get Chrome cookies",
+                )?;
+                downloader::build_client(&cookies)
+            }
+            if let Ok(c) = fresh_client() {
+                client = Some(c);
+            }
+            let c = client.as_ref().unwrap();
+            match downloader::download_zip(c, job_id, user_id, i, &dir) {
+                Ok(p) => p,
+                Err(e) => {
+                    display::print_error(&format!("  [{i:02}] Download failed: {e}"));
+                    display::print_info(&format!("  [{i:02}] Refreshing cookies and retrying in 10s..."));
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if let Ok(c) = fresh_client() {
+                        client = Some(c);
+                    }
+                    match downloader::download_zip(client.as_ref().unwrap(), job_id, user_id, i, &dir) {
+                        Ok(p) => p,
+                        Err(e2) => {
+                            display::print_error(&format!("  [{i:02}] Retry failed: {e2} — skipping"));
+                            progress.mark_failed(i, &dir);
+                            total_failed_dl += 1;
+                            continue;
+                        }
                     }
                 }
             }

@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,9 +151,14 @@ fn read_cookies(db_path: &Path, key: &[u8; COOKIES_KEY_LEN]) -> Result<HashMap<S
 
     // Chrome 130+ (DB meta version ≥ 24) prefixes decrypted values with
     // SHA256(host_key). We must strip those 32 bytes to get the real value.
+    // Note: Chrome stores the version as TEXT, not INTEGER.
     let db_version: i64 = conn
         .query_row("SELECT value FROM meta WHERE key='version'", [], |r| {
-            r.get(0)
+            r.get::<_, String>(0)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(Ok)
+                .unwrap_or_else(|| r.get::<_, i64>(0))
         })
         .unwrap_or(0);
 
@@ -218,7 +223,9 @@ fn decrypt_cookie_value(
             if decrypted[..32] == hash[..] {
                 &decrypted[32..]
             } else {
-                decrypted
+                // Hash doesn't match — might be a different prefix scheme.
+                // Strip the 32-byte prefix anyway as it's certainly not cookie data.
+                &decrypted[32..]
             }
         } else {
             decrypted
@@ -293,6 +300,19 @@ pub fn download_zip(
             "HEAD {} → {} (auth issue? re-run to refresh cookies)",
             url,
             head.status()
+        );
+    }
+
+    // Detect auth redirect — Google returns 200 with text/html for login pages
+    let content_type = head
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if content_type.contains("text/html") {
+        bail!(
+            "HEAD returned text/html (auth redirect to {}) — use --chrome to download via browser",
+            head.url()
         );
     }
 
@@ -418,6 +438,110 @@ pub fn download_zip(
     );
 
     Ok(dest)
+}
+
+// MARK: - Chrome-delegated download
+
+/// Download Takeout part `i` by opening the URL in Chrome.
+/// Chrome handles passkey/re-auth challenges natively.
+/// Watches the download directory for the completed zip file.
+pub fn download_via_chrome(
+    job_id: &str,
+    user_id: &str,
+    i: usize,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let url = build_url(job_id, user_id, i);
+
+    // Snapshot existing zip files before opening Chrome
+    let existing_zips: HashSet<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().map_or(false, |ext| ext == "zip")
+                && p.file_name()
+                    .map_or(false, |n| n.to_string_lossy().starts_with("takeout-"))
+        })
+        .collect();
+
+    println!("  [{i:02}] Opening download URL in Chrome...");
+    Command::new("open")
+        .args(["-a", "Google Chrome", &url])
+        .spawn()
+        .context("Failed to open URL in Chrome")?;
+
+    println!(
+        "  [{i:02}] Waiting for Chrome to download (authenticate if prompted)..."
+    );
+
+    // Poll for new zip file or .crdownload file
+    // Chrome uses either "takeout-xxx.zip.crdownload" or "Unconfirmed XXXXXX.crdownload"
+    let poll_interval = std::time::Duration::from_secs(5);
+    let progress_interval = std::time::Duration::from_secs(30);
+    let timeout = std::time::Duration::from_secs(7200); // 2h max per part
+    let start = std::time::Instant::now();
+    let mut crdownload_seen = false;
+    let mut last_progress = std::time::Instant::now() - progress_interval;
+
+    loop {
+        if start.elapsed() > timeout {
+            bail!("Timed out waiting for Chrome to download part {i}");
+        }
+
+        // Check for ANY .crdownload files (Chrome's partial download indicator)
+        let crdownloads: Vec<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map_or(false, |ext| ext == "crdownload"))
+            .collect();
+
+        if !crdownloads.is_empty() && !crdownload_seen {
+            crdownload_seen = true;
+            println!("  [{i:02}] Download started in Chrome");
+        }
+
+        // Check for new completed zip files
+        let current_zips: HashSet<PathBuf> = std::fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map_or(false, |ext| ext == "zip")
+                    && p.file_name()
+                        .map_or(false, |n| n.to_string_lossy().starts_with("takeout-"))
+            })
+            .collect();
+
+        let new_zips: Vec<&PathBuf> = current_zips.difference(&existing_zips).collect();
+
+        if !new_zips.is_empty() {
+            // Found a new zip — verify it's not still being written
+            for zip_path in &new_zips {
+                // Check no .crdownload files remain (Chrome renames atomically on completion)
+                if crdownloads.is_empty() || (crdownload_seen && crdownloads.is_empty()) {
+                    let size = zip_path.metadata()?.len();
+                    println!(
+                        "  [{i:02}] Chrome download complete → {} ({:.1}GB)",
+                        zip_path.file_name().unwrap_or_default().to_string_lossy(),
+                        size as f64 / 1024.0 / 1024.0 / 1024.0
+                    );
+                    return Ok(zip_path.to_path_buf());
+                }
+            }
+        }
+
+        // Show progress for active downloads
+        if crdownload_seen && last_progress.elapsed() >= progress_interval {
+            for cd in &crdownloads {
+                if let Ok(meta) = cd.metadata() {
+                    let gb = meta.len() as f64 / 1024.0 / 1024.0 / 1024.0;
+                    println!("  [{i:02}] Downloading... {gb:.1}GB so far");
+                    last_progress = std::time::Instant::now();
+                }
+            }
+        }
+
+        std::thread::sleep(poll_interval);
+    }
 }
 
 fn extract_filename(resp: &reqwest::blocking::Response) -> Option<String> {
