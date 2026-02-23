@@ -528,6 +528,7 @@ pub fn download_hybrid(
     i: usize,
     dir: &Path,
     notifier: Option<&Notifier>,
+    scraped_url: Option<&str>,
 ) -> Result<PathBuf> {
     // 1. If we have a client, try HTTP download
     if let Some(client) = client {
@@ -549,8 +550,13 @@ pub fn download_hybrid(
         println!("  [{i:02}] No HTTP client available; using Chrome directly");
     }
 
-    // 2. Fallback to Chrome
-    download_via_chrome(job_id, user_id, i, dir, notifier)
+    // 2. Use scraped URL (fresh session tokens) if available, otherwise construct one
+    let url = scraped_url
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| build_url(job_id, user_id, i));
+
+    // 3. Fallback to Chrome
+    download_via_chrome_with_url(&url, i, dir, notifier)
 }
 
 /// Extract Chrome cookies and build an HTTP client.
@@ -568,22 +574,132 @@ pub fn try_build_http_client() -> Option<Client> {
     }
 }
 
+// MARK: - Chrome AppleScript helpers
+
+/// Wait for Chrome's active tab to finish loading (replaces fixed sleep).
+fn chrome_wait_for_load() {
+    let script = r#"
+tell application "Google Chrome"
+    repeat 30 times
+        if loading of active tab of first window is false then return "done"
+        delay 0.5
+    end repeat
+    return "timeout"
+end tell"#;
+    let _ = Command::new("osascript").args(["-e", script]).output();
+}
+
+/// Get the URL of Chrome's active tab.
+fn chrome_active_url() -> Option<String> {
+    let output = Command::new("osascript")
+        .args(["-e", r#"tell application "Google Chrome" to return URL of active tab of first window"#])
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
+}
+
+/// Navigate Chrome's active tab to a URL and wait for load.
+fn chrome_navigate(url: &str) {
+    let script = format!(
+        r#"tell application "Google Chrome" to set URL of active tab of first window to "{}""#,
+        url
+    );
+    let _ = Command::new("osascript").args(["-e", &script]).output();
+    chrome_wait_for_load();
+}
+
+/// Execute JavaScript in Chrome's active tab. Returns the result string.
+fn chrome_exec_js(js: &str) -> Option<String> {
+    let script = format!(
+        r#"tell application "Google Chrome" to execute active tab of front window javascript "{}""#,
+        js.replace('"', "\\\"")
+    );
+    let output = Command::new("osascript").args(["-e", &script]).output().ok()?;
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if result.is_empty() { None } else { Some(result) }
+}
+
+/// Check if Chrome is currently showing a Google auth page.
+fn chrome_is_on_auth_page() -> bool {
+    chrome_active_url()
+        .map(|u| u.contains("accounts.google.com") || u.contains("signin"))
+        .unwrap_or(false)
+}
+
+/// Navigate Chrome to the Takeout page, then redirect to the download URL via JS.
+/// This ensures the proper Referer header is sent.
+fn chrome_open_with_referrer(url: &str) -> Result<()> {
+    Command::new("open")
+        .args(["-a", "Google Chrome", "https://takeout.google.com/"])
+        .spawn()
+        .context("Failed to open Chrome")?;
+    chrome_wait_for_load();
+    let js = format!("window.location.href='{}'", url.replace('\'', "\\'"));
+    chrome_exec_js(&js);
+    Ok(())
+}
+
+/// Scrape fresh download URLs from the Takeout manage exports page.
+/// Returns a map of part number → URL. Falls back gracefully if scraping fails.
+pub fn scrape_takeout_urls() -> HashMap<usize, String> {
+    let mut urls = HashMap::new();
+
+    println!("  Scraping fresh download URLs from Takeout page...");
+    chrome_navigate("https://takeout.google.com/settings/takeout/downloads");
+
+    // Give the SPA a moment to render download links
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Extract all download links via JS, encoding into the document title
+    let js = r#"(function(){var links=Array.from(document.querySelectorAll('a[href*=\"/takeout/download\"]')).map(function(l){return l.href});document.title='PFURLS:'+links.join('|||');})()"#;
+    chrome_exec_js(js);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Read back from title
+    let script = r#"tell application "Google Chrome" to return title of active tab of first window"#;
+    let output = match Command::new("osascript").args(["-e", script]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => return urls,
+    };
+
+    if let Some(data) = output.strip_prefix("PFURLS:") {
+        for link in data.split("|||") {
+            let link = link.trim();
+            if link.is_empty() { continue; }
+            // Parse part number from &i=N parameter
+            if let Some(i_pos) = link.find("&i=") {
+                let rest = &link[i_pos + 3..];
+                let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(part) = num_str.parse::<usize>() {
+                    urls.insert(part, link.to_string());
+                }
+            }
+        }
+        if !urls.is_empty() {
+            println!("  Scraped {} fresh download URLs from Takeout page", urls.len());
+        } else {
+            println!("  No download URLs found on Takeout page — using constructed URLs");
+        }
+    } else {
+        println!("  Could not scrape Takeout page — using constructed URLs");
+    }
+
+    urls
+}
+
 // MARK: - Chrome-delegated download
 
-/// Download Takeout part `i` by opening the URL in Chrome.
+/// Download Takeout part by opening a URL in Chrome with proper referrer.
 /// Chrome handles passkey/re-auth challenges natively.
 /// Watches the download directory for the completed zip file.
-///
-/// For parallel safety: snapshots existing `.crdownload` files before opening
-/// Chrome and only tracks NEW ones belonging to this worker.
-pub fn download_via_chrome(
-    job_id: &str,
-    user_id: &str,
+/// Instant auth detection via AppleScript URL polling (replaces 60s blind wait).
+fn download_via_chrome_with_url(
+    url: &str,
     i: usize,
     dir: &Path,
     notifier: Option<&Notifier>,
 ) -> Result<PathBuf> {
-    let url = build_url(job_id, user_id, i);
 
     // Snapshot existing zip files before opening Chrome
     let existing_zips: HashSet<PathBuf> = std::fs::read_dir(dir)?
@@ -613,22 +729,17 @@ pub fn download_via_chrome(
         true
     } else {
         println!("  [{i:02}] Opening download URL in Chrome (via Takeout referrer)...");
-        // Open takeout.google.com first, then navigate via JS so Chrome
-        // sends the proper Referer header (direct URL opening causes 500s)
-        Command::new("open")
-            .args(["-a", "Google Chrome", "https://takeout.google.com/"])
-            .spawn()
-            .context("Failed to open Chrome")?;
-        std::thread::sleep(Duration::from_secs(3));
-        let js = format!("window.location.href='{}'", url.replace('\'', "\\'"));
-        let applescript = format!(
-            r#"tell application "Google Chrome" to execute active tab of front window javascript "{}""#,
-            js
-        );
-        Command::new("osascript")
-            .args(["-e", &applescript])
-            .output()
-            .context("Failed to navigate Chrome via AppleScript")?;
+        chrome_open_with_referrer(url)?;
+
+        // Instant auth detection: check if Chrome landed on a login page
+        std::thread::sleep(Duration::from_secs(2));
+        if chrome_is_on_auth_page() {
+            let msg = format!(
+                "photoferry: Part {i} needs auth — Chrome is on Google sign-in page. Authenticate to continue."
+            );
+            println!("  [{i:02}] AUTH REQUIRED: {msg}");
+            notify::notify(notifier, &msg);
+        }
         false
     };
 
@@ -650,13 +761,11 @@ pub fn download_via_chrome(
 
     let poll_interval = Duration::from_secs(5);
     let progress_interval = Duration::from_secs(30);
-    let auth_alert_timeout = Duration::from_secs(60); // alert if no crdownload after 60s
     let stall_timeout = Duration::from_secs(120); // 2 min stall = retry
     let timeout = Duration::from_secs(7200); // 2h max per part
     let max_retries = 3;
     let start = Instant::now();
     let mut crdownload_seen = false;
-    let mut auth_alerted = false;
     let mut last_progress = Instant::now() - progress_interval;
     let mut last_size: u64 = 0;
     let mut last_size_change = Instant::now();
@@ -682,12 +791,16 @@ pub fn download_via_chrome(
             println!("  [{i:02}] Download started in Chrome");
         }
 
-        // Auth stall alert: no .crdownload appeared within 60s
-        if !crdownload_seen && !auth_alerted && start.elapsed() > auth_alert_timeout {
-            auth_alerted = true;
-            let msg = format!("photoferry: Part {i} may need auth — no download started after 60s. Check Chrome.");
-            println!("  [{i:02}] WARNING: {msg}");
-            notify::notify(notifier, &msg);
+        // Periodic auth check: if no download started, check if Chrome is on auth page
+        if !crdownload_seen && !attached && start.elapsed().as_secs() % 30 == 0 {
+            if chrome_is_on_auth_page() {
+                let msg = format!(
+                    "photoferry: Part {i} still waiting for auth ({}s elapsed). Check Chrome.",
+                    start.elapsed().as_secs()
+                );
+                println!("  [{i:02}] {msg}");
+                notify::notify(notifier, &msg);
+            }
         }
 
         // Stall detection: if download started but size hasn't changed in 2 min, retry
@@ -718,20 +831,7 @@ pub fn download_via_chrome(
                     let _ = std::fs::remove_file(cd);
                 }
                 // Re-open via Takeout referrer
-                Command::new("open")
-                    .args(["-a", "Google Chrome", "https://takeout.google.com/"])
-                    .spawn()
-                    .context("Failed to open Chrome")?;
-                std::thread::sleep(Duration::from_secs(3));
-                let js = format!("window.location.href='{}'", url.replace('\'', "\\'"));
-                let applescript = format!(
-                    r#"tell application "Google Chrome" to execute active tab of front window javascript "{}""#,
-                    js
-                );
-                Command::new("osascript")
-                    .args(["-e", &applescript])
-                    .output()
-                    .context("Failed to navigate Chrome via AppleScript")?;
+                chrome_open_with_referrer(url)?;
                 crdownload_seen = false;
                 last_size = 0;
                 last_size_change = Instant::now();

@@ -1161,6 +1161,9 @@ fn cmd_download(
     // Extract cookies on main thread (Keychain may need interactive access)
     let mut http_client = downloader::try_build_http_client().map(Arc::new);
 
+    // Scrape fresh download URLs from Takeout page (carries session tokens)
+    let scraped_urls = Arc::new(downloader::scrape_takeout_urls());
+
     let progress = Arc::new(Mutex::new(progress));
 
     if concurrency > 1 {
@@ -1180,6 +1183,7 @@ fn cmd_download(
             let tx = tx.clone();
             let notifier = notifier.clone();
             let http_client = http_client.clone();
+            let scraped_urls = Arc::clone(&scraped_urls);
             let progress = Arc::clone(&progress);
             let job_id = job_id.to_string();
             let user_id = user_id.to_string();
@@ -1213,6 +1217,7 @@ fn cmd_download(
                         part,
                         &dir,
                         notifier.as_deref(),
+                        scraped_urls.get(&part).map(|s| s.as_str()),
                     ) {
                         Ok(zip_path) => {
                             let size = zip_path.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1408,6 +1413,7 @@ fn cmd_download(
                 i,
                 &dir,
                 notifier.as_deref(),
+                scraped_urls.get(&i).map(|s| s.as_str()),
             ) {
                 Ok(p) => p,
                 Err(e) => {
