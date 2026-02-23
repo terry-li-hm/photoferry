@@ -8,7 +8,6 @@ mod sidecar;
 mod takeout;
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{HashMap, HashSet};
@@ -121,9 +120,6 @@ enum Commands {
         /// Download only, skip import
         #[arg(long)]
         download_only: bool,
-        /// Use Chrome browser for downloading (handles passkey/re-auth)
-        #[arg(long)]
-        chrome: bool,
         /// Print per-file import results
         #[arg(long)]
         verbose: bool,
@@ -188,7 +184,6 @@ fn main() -> Result<()> {
             end,
             concurrency,
             download_only,
-            chrome,
             verbose,
             include_trashed,
             strict_extensions,
@@ -202,7 +197,6 @@ fn main() -> Result<()> {
             end,
             concurrency,
             download_only,
-            chrome,
             verbose,
             include_trashed,
             strict_extensions,
@@ -1094,7 +1088,6 @@ fn cmd_download(
     end: usize,
     concurrency: usize,
     download_only: bool,
-    use_chrome: bool,
     verbose: bool,
     include_trashed: bool,
     strict_extensions: bool,
@@ -1163,8 +1156,8 @@ fn cmd_download(
     let mut total_failed_dl = 0usize;
     let mut total_failed_import = 0usize;
 
-    if use_chrome && concurrency > 1 {
-        // ── Parallel Chrome downloads with sequential import ──────────
+    if concurrency > 1 {
+        // ── Parallel hybrid downloads with sequential import ──────────
 
         let work_queue = Arc::new(Mutex::new(work));
         let gate = Arc::new(downloader::DiskSpaceGate::new(dir.clone(), 20));
@@ -1192,7 +1185,7 @@ fn cmd_download(
                     gate.wait(part);
                     let start_time = std::time::Instant::now();
 
-                    match downloader::download_via_chrome(
+                    match downloader::download_hybrid(
                         &job_id,
                         &user_id,
                         part,
@@ -1347,7 +1340,7 @@ fn cmd_download(
                 }
                 downloader::DownloadEvent::Failed { part, error } => {
                     display::print_error(&format!(
-                        "  [{part:02}] Chrome download failed: {error} — skipping"
+                        "  [{part:02}] Download failed: {error} — skipping"
                     ));
                     progress.mark_failed(part, &dir);
                     total_failed_dl += 1;
@@ -1364,23 +1357,7 @@ fn cmd_download(
             let _ = h.join();
         }
     } else {
-        // ── Serial mode (concurrency=1 or non-Chrome HTTP) ───────────
-
-        let mut client: Option<Client> = if !use_chrome {
-            fn fresh_client() -> Result<Client> {
-                let cookies = downloader::get_chrome_cookies().context(
-                    "Failed to get Chrome cookies — ensure Chrome is running and logged into Google",
-                )?;
-                display::print_info(&format!("Loaded {} Google cookies", cookies.len()));
-                downloader::build_client(&cookies)
-            }
-            Some(fresh_client()?)
-        } else {
-            display::print_info(
-                "Using Chrome browser for downloads (passkey/re-auth handled natively)",
-            );
-            None
-        };
+        // ── Serial hybrid downloads ──────────────────────────────────
 
         let gate = downloader::DiskSpaceGate::new(dir.clone(), 20);
 
@@ -1392,71 +1369,25 @@ fn cmd_download(
             let part_start = std::time::Instant::now();
 
             // Download
-            let zip_path = if use_chrome {
-                match downloader::download_via_chrome(
-                    job_id,
-                    user_id,
-                    i,
-                    &dir,
-                    notifier.as_deref(),
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        display::print_error(&format!(
-                            "  [{i:02}] Chrome download failed: {e} — skipping"
-                        ));
-                        progress.mark_failed(i, &dir);
-                        total_failed_dl += 1;
-                        notify::notify(
-                            notifier.as_deref(),
-                            &format!("photoferry: FAILED part {i} download — {e}"),
-                        );
-                        continue;
-                    }
-                }
-            } else {
-                fn fresh_client() -> Result<Client> {
-                    let cookies = downloader::get_chrome_cookies()
-                        .context("Failed to get Chrome cookies")?;
-                    downloader::build_client(&cookies)
-                }
-                if let Ok(c) = fresh_client() {
-                    client = Some(c);
-                }
-                let c = client.as_ref().unwrap();
-                match downloader::download_zip(c, job_id, user_id, i, &dir) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        display::print_error(&format!("  [{i:02}] Download failed: {e}"));
-                        display::print_info(&format!(
-                            "  [{i:02}] Refreshing cookies and retrying in 10s..."
-                        ));
-                        std::thread::sleep(std::time::Duration::from_secs(10));
-                        if let Ok(c) = fresh_client() {
-                            client = Some(c);
-                        }
-                        match downloader::download_zip(
-                            client.as_ref().unwrap(),
-                            job_id,
-                            user_id,
-                            i,
-                            &dir,
-                        ) {
-                            Ok(p) => p,
-                            Err(e2) => {
-                                display::print_error(&format!(
-                                    "  [{i:02}] Retry failed: {e2} — skipping"
-                                ));
-                                progress.mark_failed(i, &dir);
-                                total_failed_dl += 1;
-                                notify::notify(
-                                    notifier.as_deref(),
-                                    &format!("photoferry: FAILED part {i} download — {e2}"),
-                                );
-                                continue;
-                            }
-                        }
-                    }
+            let zip_path = match downloader::download_hybrid(
+                job_id,
+                user_id,
+                i,
+                &dir,
+                notifier.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    display::print_error(&format!(
+                        "  [{i:02}] Download failed: {e} — skipping"
+                    ));
+                    progress.mark_failed(i, &dir);
+                    total_failed_dl += 1;
+                    notify::notify(
+                        notifier.as_deref(),
+                        &format!("photoferry: FAILED part {i} download — {e}"),
+                    );
+                    continue;
                 }
             };
 

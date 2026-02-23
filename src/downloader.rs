@@ -370,7 +370,7 @@ pub fn download_zip(
         .unwrap_or("");
     if content_type.contains("text/html") {
         bail!(
-            "HEAD returned text/html (auth redirect to {}) — use --chrome to download via browser",
+            "HEAD returned text/html (auth redirect to {}) — will fall back to Chrome",
             head.url()
         );
     }
@@ -497,6 +497,48 @@ pub fn download_zip(
     );
 
     Ok(dest)
+}
+
+// MARK: - Hybrid download
+
+/// Try downloading via HTTP first (fast), fall back to Chrome (reliable/auth) if needed.
+pub fn download_hybrid(
+    job_id: &str,
+    user_id: &str,
+    i: usize,
+    dir: &Path,
+    notifier: Option<&Notifier>,
+) -> Result<PathBuf> {
+    // 1. Try to get cookies and build client
+    let client = match get_chrome_cookies() {
+        Ok(cookies) => build_client(&cookies).ok(),
+        Err(_) => None,
+    };
+
+    // 2. If we have a client, try download_zip
+    if let Some(client) = client {
+        match download_zip(&client, job_id, user_id, i, dir) {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                let err_msg = e.to_string();
+                // Fall back to Chrome only on auth-related errors
+                // (text/html redirect, 4xx status, or invalid ZIP magic bytes)
+                let is_auth_error = err_msg.contains("text/html")
+                    || err_msg.contains("auth issue")
+                    || err_msg.contains("auth may have expired");
+
+                if !is_auth_error {
+                    return Err(e);
+                }
+                println!("  [{i:02}] HTTP download failed (auth?); falling back to Chrome...");
+            }
+        }
+    } else {
+        println!("  [{i:02}] Could not load Chrome cookies; using Chrome fallback directly");
+    }
+
+    // 3. Fallback to Chrome
+    download_via_chrome(job_id, user_id, i, dir, notifier)
 }
 
 // MARK: - Chrome-delegated download
