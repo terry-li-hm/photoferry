@@ -612,11 +612,23 @@ pub fn download_via_chrome(
         );
         true
     } else {
-        println!("  [{i:02}] Opening download URL in Chrome...");
+        println!("  [{i:02}] Opening download URL in Chrome (via Takeout referrer)...");
+        // Open takeout.google.com first, then navigate via JS so Chrome
+        // sends the proper Referer header (direct URL opening causes 500s)
         Command::new("open")
-            .args(["-a", "Google Chrome", &url])
+            .args(["-a", "Google Chrome", "https://takeout.google.com/"])
             .spawn()
-            .context("Failed to open URL in Chrome")?;
+            .context("Failed to open Chrome")?;
+        std::thread::sleep(Duration::from_secs(3));
+        let js = format!("window.location.href='{}'", url.replace('\'', "\\'"));
+        let applescript = format!(
+            r#"tell application "Google Chrome" to execute active tab of front window javascript "{}""#,
+            js
+        );
+        Command::new("osascript")
+            .args(["-e", &applescript])
+            .output()
+            .context("Failed to navigate Chrome via AppleScript")?;
         false
     };
 
@@ -705,11 +717,21 @@ pub fn download_via_chrome(
                 for cd in &crdownloads {
                     let _ = std::fs::remove_file(cd);
                 }
-                // Re-open in Chrome
+                // Re-open via Takeout referrer
                 Command::new("open")
-                    .args(["-a", "Google Chrome", &url])
+                    .args(["-a", "Google Chrome", "https://takeout.google.com/"])
                     .spawn()
-                    .context("Failed to re-open URL in Chrome")?;
+                    .context("Failed to open Chrome")?;
+                std::thread::sleep(Duration::from_secs(3));
+                let js = format!("window.location.href='{}'", url.replace('\'', "\\'"));
+                let applescript = format!(
+                    r#"tell application "Google Chrome" to execute active tab of front window javascript "{}""#,
+                    js
+                );
+                Command::new("osascript")
+                    .args(["-e", &applescript])
+                    .output()
+                    .context("Failed to navigate Chrome via AppleScript")?;
                 crdownload_seen = false;
                 last_size = 0;
                 last_size_change = Instant::now();
