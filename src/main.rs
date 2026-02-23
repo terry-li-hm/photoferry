@@ -1158,7 +1158,9 @@ fn cmd_download(
         // ── Parallel hybrid downloads with sequential import ──────────
 
         let work_queue = Arc::new(Mutex::new(work));
-        let gate = Arc::new(downloader::DiskSpaceGate::new(dir.clone(), 20));
+        // Each concurrent download needs ~55GB. Gate must ensure enough space for all workers.
+        let min_free_gb = 55 * concurrency as u64;
+        let gate = Arc::new(downloader::DiskSpaceGate::new(dir.clone(), min_free_gb));
         let (tx, rx) = mpsc::channel::<downloader::DownloadEvent>();
 
         // Spawn N download worker threads
