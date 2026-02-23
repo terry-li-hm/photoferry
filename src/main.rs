@@ -132,9 +132,9 @@ enum Commands {
         /// Write CSV report of unknown files to PATH
         #[arg(long)]
         unknown_report: Option<PathBuf>,
-        /// Confirm Photos.app shows iCloud upload queue is complete (for safe zip deletion)
+        /// Keep zip files after successful import+verify (default: delete)
         #[arg(long)]
-        icloud_confirmed: bool,
+        keep_zips: bool,
     },
 }
 
@@ -188,7 +188,7 @@ fn main() -> Result<()> {
             include_trashed,
             strict_extensions,
             unknown_report,
-            icloud_confirmed,
+            keep_zips,
         }) => cmd_download(
             &job,
             &user,
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
             include_trashed,
             strict_extensions,
             unknown_report.as_deref(),
-            icloud_confirmed,
+            keep_zips,
         )?,
     }
 
@@ -1092,7 +1092,7 @@ fn cmd_download(
     include_trashed: bool,
     strict_extensions: bool,
     unknown_report: Option<&Path>,
-    icloud_confirmed: bool,
+    keep_zips: bool,
 ) -> Result<()> {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -1108,10 +1108,8 @@ fn cmd_download(
         "Downloading Takeout parts {start}–{end} → {} (concurrency: {concurrency})",
         dir.display()
     ));
-    if !download_only && !icloud_confirmed {
-        display::print_warning(
-            "iCloud sync is not confirmed. ZIPs will be kept even when local verify passes.",
-        );
+    if !download_only && keep_zips {
+        display::print_info("--keep-zips: ZIPs will be kept after import+verify.");
     }
 
     // Check Photos access up front (unless download-only)
@@ -1278,10 +1276,10 @@ fn cmd_download(
                             } else {
                                 if verify_zip_manifest(&zip_path, &dir) {
                                     progress.mark_completed(part, &dir);
-                                    match verify_success_action(icloud_confirmed) {
+                                    match verify_success_action(keep_zips) {
                                         VerifySuccessAction::KeepZipAndMarkCompleted => {
                                             display::print_warning(&format!(
-                                                "  [{part:02}] Verify passed — keeping zip (iCloud sync not confirmed)"
+                                                "  [{part:02}] Verify passed — keeping zip (--keep-zips)"
                                             ));
                                         }
                                         VerifySuccessAction::DeleteZipAndMarkCompleted => {
@@ -1442,10 +1440,10 @@ fn cmd_download(
                     } else {
                         if verify_zip_manifest(&zip_path, &dir) {
                             progress.mark_completed(i, &dir);
-                            match verify_success_action(icloud_confirmed) {
+                            match verify_success_action(keep_zips) {
                                 VerifySuccessAction::KeepZipAndMarkCompleted => {
                                     display::print_warning(&format!(
-                                        "  [{i:02}] Verify passed — keeping zip (iCloud sync not confirmed)"
+                                        "  [{i:02}] Verify passed — keeping zip (--keep-zips)"
                                     ));
                                 }
                                 VerifySuccessAction::DeleteZipAndMarkCompleted => {
@@ -1580,11 +1578,11 @@ enum VerifySuccessAction {
     DeleteZipAndMarkCompleted,
 }
 
-fn verify_success_action(icloud_confirmed: bool) -> VerifySuccessAction {
-    if icloud_confirmed {
-        VerifySuccessAction::DeleteZipAndMarkCompleted
-    } else {
+fn verify_success_action(keep_zips: bool) -> VerifySuccessAction {
+    if keep_zips {
         VerifySuccessAction::KeepZipAndMarkCompleted
+    } else {
+        VerifySuccessAction::DeleteZipAndMarkCompleted
     }
 }
 
@@ -2777,18 +2775,18 @@ mod tests {
     }
 
     #[test]
-    fn verify_success_action_keeps_zip_but_marks_completed_without_icloud_confirmation() {
+    fn verify_success_action_deletes_zip_by_default() {
         assert_eq!(
             verify_success_action(false),
-            VerifySuccessAction::KeepZipAndMarkCompleted
+            VerifySuccessAction::DeleteZipAndMarkCompleted
         );
     }
 
     #[test]
-    fn verify_success_action_deletes_zip_when_icloud_is_confirmed() {
+    fn verify_success_action_keeps_zip_when_keep_zips_set() {
         assert_eq!(
             verify_success_action(true),
-            VerifySuccessAction::DeleteZipAndMarkCompleted
+            VerifySuccessAction::KeepZipAndMarkCompleted
         );
     }
 }
