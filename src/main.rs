@@ -135,6 +135,9 @@ enum Commands {
         /// Keep zip files after successful import+verify (default: delete)
         #[arg(long)]
         keep_zips: bool,
+        /// File with pre-scraped download URLs (one per line, with rapt tokens)
+        #[arg(long)]
+        urls_file: Option<PathBuf>,
     },
 }
 
@@ -189,6 +192,7 @@ fn main() -> Result<()> {
             strict_extensions,
             unknown_report,
             keep_zips,
+            urls_file,
         }) => cmd_download(
             &job,
             &user,
@@ -202,6 +206,7 @@ fn main() -> Result<()> {
             strict_extensions,
             unknown_report.as_deref(),
             keep_zips,
+            urls_file.as_deref(),
         )?,
     }
 
@@ -1080,6 +1085,26 @@ fn cmd_albums(dir: &Path) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Load download URLs from a file (one URL per line). Parses &i=N to index by part number.
+fn load_urls_file(path: &Path) -> Result<HashMap<usize, String>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read URLs file: {}", path.display()))?;
+    let mut urls = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some(i_pos) = line.find("&i=") {
+            let rest = &line[i_pos + 3..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(part) = num_str.parse::<usize>() {
+                urls.insert(part, line.to_string());
+            }
+        }
+    }
+    display::print_info(&format!("Loaded {} URLs from {}", urls.len(), path.display()));
+    Ok(urls)
+}
+
 fn cmd_download(
     job_id: &str,
     user_id: &str,
@@ -1093,6 +1118,7 @@ fn cmd_download(
     strict_extensions: bool,
     unknown_report: Option<&Path>,
     keep_zips: bool,
+    urls_file: Option<&Path>,
 ) -> Result<()> {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, mpsc};
@@ -1161,8 +1187,12 @@ fn cmd_download(
     // Extract cookies on main thread (Keychain may need interactive access)
     let mut http_client = downloader::try_build_http_client().map(Arc::new);
 
-    // Scrape fresh download URLs from Takeout page (carries session tokens)
-    let scraped_urls = Arc::new(downloader::scrape_takeout_urls());
+    // Load pre-scraped URLs (with rapt tokens) or scrape from Takeout page
+    let scraped_urls = Arc::new(if let Some(path) = urls_file {
+        load_urls_file(path)?
+    } else {
+        downloader::scrape_takeout_urls()
+    });
 
     let progress = Arc::new(Mutex::new(progress));
 
